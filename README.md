@@ -95,7 +95,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   message's menu, or Ctrl-click (Command-click on macOS) on a message, starts
   a selection: click more messages to add or remove them, Shift-click to add
   everything up to the one you click, then **Forward…** sends them together,
-  in their original order, or Escape cancels.
+  in their original order, or Escape cancels. A batch goes out one message at
+  a time, each starting once the one before it reached WhatsApp, so a picture
+  cannot overtake the text that came before it.
 - **WhatsApp formatting.** Bold, italic, strikethrough, code, lists, quotes,
   mentions, and link previews are supported. Links are clickable. Hebrew,
   Arabic, and mixed lines follow the Unicode Bidirectional Algorithm, so
@@ -219,7 +221,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   on click. Photos, stickers, GIFs, voice messages, audio, locations, contacts,
   polls, and link previews appear in the chat. Click a downloaded JPEG, PNG,
   WebP, or GIF photo to preview it in ZapFast with fit and zoom controls, or
-  choose **Open externally**. Click a video to play it in its message, with
+  choose **Open externally**. In the preview, copy the image to your clipboard
+  via the copy button in the header, the right-click menu (**Copy image**), or
+  Ctrl+C (Cmd+C on macOS). Click a video to play it in its message, with
   sound, a seek bar, and a mute switch; round video messages play inside their
   circle with a progress ring, like on the phone. A video that is not
   downloaded yet downloads first and then plays. Videos in codecs other than
@@ -338,7 +342,8 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
 - **Keyboard shortcuts.** `Ctrl+K` or `Ctrl+Shift+F` searches your chats,
   `Ctrl+F` searches the open chat as in WhatsApp (`↑`/`↓` walk the results
   and Enter jumps to one; with no chat open it searches your chats, and in
-  Settings it searches the settings), `Alt+↑/↓` switches chats and
+  Settings it searches the settings), `Alt+↑/↓` or WhatsApp's
+  `Ctrl+Shift+[`/`Ctrl+Shift+]` switches chats and
   keeps the active chat visible in the list, `↑` in an empty input edits your
   previous message, `Esc` cancels the current action, `Ctrl+L` focuses the
   message input, `Ctrl+N` opens New chat, `Ctrl+B` hides or shows the chat
@@ -756,7 +761,8 @@ palettes without changing the desktop theme. Add `font=Family Name` to preview
 an installed font, for example `--demo-page "settings,font=Noto Serif"`.
 An empty or whitespace-only `font=` value restores Inter (default).
 
-Use `--demo-page interactive` for text and button messages, or
+Use `--demo-page shared-contact` for an offline shared-contact card with synthetic
+vCard data, or `--demo-page interactive` for text and button messages, or
 `--demo-page interactive-media` for messages with an image, and
 `--demo-page interactive-list` for a list message,
 `--demo-page interactive-list-dialog` for its grouped choice dialog, `--demo-page carousel`

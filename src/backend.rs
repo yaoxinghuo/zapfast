@@ -162,10 +162,10 @@ pub enum Command {
         button: usize,
         choice: Option<usize>,
     },
-    /// Forwards an archived message to another chat.
+    /// Forwards archived messages to another chat, oldest first.
     Forward {
         from_chat: ChatId,
-        message: String,
+        messages: Vec<String>,
         to_chat: ChatId,
     },
     /// Updates our typing state in a chat.
@@ -397,6 +397,8 @@ pub enum Command {
         source: std::path::PathBuf,
         name: String,
     },
+    /// Reads and decodes an image file off the UI thread for clipboard writing.
+    PrepareClipboardImage(PathBuf),
     /// Deletes an imported pack directory.
     DeleteStickerPack {
         dir: PathBuf,
@@ -849,6 +851,8 @@ pub enum Event {
     },
     /// Informational toast message.
     Info(String),
+    /// A decoded image ready to be written to the clipboard on the interface thread.
+    ClipboardImage(Result<crate::model::DecodedImage, String>),
     /// A newer release than this build exists.
     UpdateAvailable {
         version: String,

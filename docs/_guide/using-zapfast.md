@@ -193,7 +193,13 @@ sharing format:
 The search bar finds chats by name, number, or latest message; searches all
 messages stored on this computer; and finds contacts without an existing chat.
 Click a message result to jump to it, or a contact to start a chat. Use
-`Alt+↑/↓` to switch chats without leaving the composer.
+`Alt+↑/↓`, or `Ctrl+Shift+[` and `Ctrl+Shift+]` as in WhatsApp, to switch chats
+without leaving the composer (Command instead of Ctrl on macOS).
+
+A shared contact message shows the name from its vCard. When the card names a
+WhatsApp account, **Chat** opens a private conversation with it and, if the
+person is not already in ZapFast's contacts, **Add** saves them, following the
+contact-saving setting. A card with only a local number shows the number.
 
 The chips under the search bar narrow the list to **Unread**, **Private**
 (one-to-one chats), or **Groups**. A chip with unread chats shows how many it

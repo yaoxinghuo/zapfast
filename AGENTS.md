@@ -172,10 +172,13 @@ protocol. These notes are for coding agents and new contributors.
   history request for such a chat is anchored at the present with an
   empty message id (`worker::fetch_older`), and the app asks the phone
   as soon as such a chat loads or opens, instead of never.
-- `eframe`'s `glow_options` turn vsync off: a Wayland compositor stops
-  sending frame callbacks to a window on a hidden workspace, a vsync wait
-  there blocks the event loop and its ping replies, and Hyprland then
-  calls the app unresponsive. Repaints are event-driven, so nothing spins.
+- `src/vsync.rs` decides vsync once per run. A Wayland compositor stops
+  sending frame callbacks to a hidden window, and a vsync wait there blocks
+  the event loop and its ping replies, so Hyprland calls the app
+  unresponsive. Vsync is on only where that cannot happen: off Wayland, or
+  when the compositor reports hidden windows as suspended (xdg_wm_base v6),
+  which the winit fork turns into `Occluded` so eframe stops painting them.
+  Repaints are event-driven, so nothing spins.
 - `src/voice.rs` is the codec for voice messages: OGG/Opus in and out
   (the `ogg` crate for the container, `opus` with libopus bundled and
   built by cmake for the codec, so cmake is a build dependency), plus
@@ -248,11 +251,18 @@ protocol. These notes are for coding agents and new contributors.
 - Platform-specific code belongs behind `cfg` blocks; a change for one
   platform must keep the other two compiling.
 
-Three egui pitfalls this code has already hit:
+egui pitfalls this code has already hit:
 
 - `consume_key(Modifiers::NONE, key)` also matches the key with Shift held
   (egui only insists on the modifiers you ask for), so the composer
   inspects the events itself to tell Enter from Shift+Enter.
+- `consume_key` matches the logical key, and with Shift held US-style
+  layouts report `[` and `]` as `{` and `}` (and `=` as `+`), so a Shift
+  shortcut binds both spellings: see the bracket and `Plus`/`Equals` rows in
+  `ui/keys.rs`. Layouts that put another character on the shifted key never
+  produce either spelling; `Alt+↑/↓` is the layout-independent way to switch
+  chats. A long label in `SHORTCUTS` widens the dialog's key column and
+  truncates the descriptions at the default window size.
 - `with_layout(..., Align::Center)` directly inside a vertical container
   claims the whole available height; wrap it in `ui.horizontal`.
 - `ui.horizontal` inside a right-aligned bubble lays out right to left;
