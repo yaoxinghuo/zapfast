@@ -289,6 +289,11 @@ fn sections(app: &App) -> Vec<Section> {
     };
     appearance.row("Theme", detail, theme_picker);
     appearance.row(
+        translated(locale, "Font"),
+        "Used throughout the interface and messages. Unavailable fonts use Inter.",
+        font_picker,
+    );
+    appearance.row(
         "Wallpaper",
         app.settings.wallpaper_color_for(palette.dark).label(),
         move |ui, app| {
@@ -738,6 +743,7 @@ fn theme_picker(ui: &mut egui::Ui, app: &mut App) {
                     }
                 }
             });
+        theme::reveal_focus(&response.response);
         let rect = response.response.rect;
         let text = widgets::line(
             ui,
@@ -772,6 +778,87 @@ fn theme_picker(ui: &mut egui::Ui, app: &mut App) {
     });
 }
 
+/// The font menu: the bundled default plus every family installed on the
+/// system, filtered by the search field at the top of the popup.
+fn font_picker(ui: &mut egui::Ui, app: &mut App) {
+    let palette = app.palette;
+    ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+        let selected = app
+            .settings
+            .font_family
+            .as_deref()
+            .unwrap_or("Inter (default)");
+        let response = egui::ComboBox::from_id_salt("appearance_font")
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .selected_text(" ")
+            .width(200.0_f32.min(ui.available_width()))
+            .height(300.0)
+            .show_ui(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.font_search)
+                        .hint_text("Search fonts")
+                        .desired_width(180.0),
+                );
+                if theme_option(
+                    ui,
+                    &palette,
+                    "Inter (default)",
+                    app.settings.font_family.is_none(),
+                ) {
+                    app.actions.push(Action::SetFont(None));
+                    ui.close();
+                }
+                let query = app.font_search.trim().to_lowercase();
+                let mut matches = 0;
+                for family in crate::system_fonts::families()
+                    .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
+                {
+                    matches += 1;
+                    if theme_option(
+                        ui,
+                        &palette,
+                        family,
+                        app.settings.font_family.as_deref() == Some(family),
+                    ) {
+                        app.actions.push(Action::SetFont(Some(family.to_owned())));
+                        ui.close();
+                    }
+                }
+                if matches == 0 {
+                    widgets::rich_text(
+                        ui,
+                        "No matching fonts",
+                        theme::regular(13.0),
+                        palette.secondary,
+                    );
+                }
+            });
+        theme::reveal_focus(&response.response);
+        let rect = response.response.rect;
+        let text = widgets::line(
+            ui,
+            selected,
+            theme::regular(14.0),
+            palette.text,
+            rect.width() - 36.0,
+            1,
+        );
+        text.paint(
+            ui,
+            egui::pos2(rect.left() + 8.0, rect.center().y - text.size().y / 2.0),
+            palette.text,
+        );
+        response.response.widget_info(|| {
+            let mut info =
+                egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), "Font");
+            info.current_text_value = Some(selected.to_owned());
+            info
+        });
+        widgets::rich_text(ui, "Hello, world! 👋", theme::regular(14.0), palette.text);
+        widgets::rich_text(ui, "Bold text 0123456789", theme::bold(14.0), palette.text);
+    });
+}
+
 /// The interface language menu.
 fn language_picker(ui: &mut egui::Ui, app: &mut App) {
     let palette = app.palette;
@@ -780,7 +867,7 @@ fn language_picker(ui: &mut egui::Ui, app: &mut App) {
         Some(locale) => locale.label().to_owned(),
         None => crate::i18n::gettext(app.locale, "Auto").into_owned(),
     };
-    egui::ComboBox::from_id_salt("interface_language")
+    let response = egui::ComboBox::from_id_salt("interface_language")
         .selected_text(label)
         .width(200.0_f32.min(ui.available_width()))
         .show_ui(ui, |ui| {
@@ -798,6 +885,7 @@ fn language_picker(ui: &mut egui::Ui, app: &mut App) {
                 }
             }
         });
+    theme::reveal_focus(&response.response);
 }
 
 /// Wallpaper colour picker and live preview.
@@ -1329,7 +1417,7 @@ fn sound_control(ui: &mut egui::Ui, app: &mut App, mention: bool) {
     {
         app.actions.push(Action::PreviewSound(current.clone()));
     }
-    egui::ComboBox::from_id_salt(("notification-sound", mention))
+    let response = egui::ComboBox::from_id_salt(("notification-sound", mention))
         .selected_text(selected)
         .width(170.0_f32.min(ui.available_width()))
         .show_ui(ui, |ui| {
@@ -1346,6 +1434,7 @@ fn sound_control(ui: &mut egui::Ui, app: &mut App, mention: bool) {
                 app.actions.push(Action::PickNotificationSound { mention });
             }
         });
+    theme::reveal_focus(&response.response);
 }
 
 /// One account privacy category's picker: what the phone holds, and the
@@ -1378,6 +1467,7 @@ fn privacy_control(ui: &mut egui::Ui, app: &mut App, kind: PrivacyKind) {
                         }
                     }
                 });
+            theme::reveal_focus(&response.response);
             let rect = response.response.rect;
             let text = widgets::line(
                 ui,

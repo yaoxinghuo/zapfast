@@ -98,6 +98,12 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   Color Emoji on macOS and Windows. On Linux, ZapFast prefers an installed
   Noto Color Emoji and falls back to the bundled copy. Emoji-only messages
   are larger.
+- **Custom fonts.** Settings → Appearance → Font lets you search installed font
+  families and apply one to the interface and messages, with a text preview.
+  Inter remains the default and is used if the chosen font becomes unavailable.
+  Emoji and language fallbacks are preserved; code stays monospace. Install fonts
+  through your operating system, then restart ZapFast to refresh the list. Zoom
+  remains a separate setting.
 - **Readable text.** Secondary text in the built-in light and dark themes
   reaches WCAG AA contrast. Inside message bubbles, times, ticks, and other
   grey text adjust to the bubble's colour, in custom themes as well.
@@ -719,7 +725,9 @@ Use `--demo-page chat-menu` to preview the compact chat context menu, and
 `video-playing` or `note-playing` starts one of them, silently.
 For deterministic theme screenshots, `--demo-page settings,omarchy` and
 `--demo-page settings,omarchy-light` preview following dark and light Omarchy
-palettes without changing the desktop theme.
+palettes without changing the desktop theme. Add `font=Family Name` to preview
+an installed font, for example `--demo-page "settings,font=Noto Serif"`.
+An empty or whitespace-only `font=` value restores Inter (default).
 
 Use `--demo-page interactive` for text and button messages, or
 `--demo-page interactive-media` for messages with an image, and

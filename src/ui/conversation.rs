@@ -6173,7 +6173,7 @@ mod tests {
     #[test]
     fn a_failed_footer_reserves_room_for_its_label() {
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
+        crate::theme::install(&ctx, None);
         let mut message = Message {
             id: "fixture".into(),
             chat: "1@s.whatsapp.net".into(),

@@ -1173,7 +1173,7 @@ mod tests {
     /// Lays `text` out as a message body with the app's own fonts.
     fn bubble(text: &str, width: f32) -> (Arc<Galley>, egui::ColorImage) {
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
+        crate::theme::install(&ctx, None);
         let galley = std::cell::RefCell::new(None);
         // Fonts are installed at the start of the first pass.
         for _ in 0..2 {
@@ -1203,7 +1203,7 @@ mod tests {
     #[test]
     fn message_bubbles_follow_the_bidi_algorithm_on_every_row() {
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
+        crate::theme::install(&ctx, None);
         let galleys = std::cell::RefCell::new(Vec::new());
         // Fonts are installed at the start of the first pass.
         for _ in 0..2 {

@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
 use objc2_app_kit::{NSApplication, NSText, NSView, NSWindowButton};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem as Native, Submenu};
@@ -106,12 +107,83 @@ fn build_menu() -> tray_icon::menu::Result<Menu> {
     Ok(menu)
 }
 
+/// Works around an AppKit bug that aborts the process when a window closes on
+/// a Mac with a Touch Bar. The Touch Bar finder observes `nextResponder` on
+/// each responder in the key window's chain and invalidates the observations
+/// from a display-cycle callback. Window teardown can remove a registration
+/// first, so the finder's `removeObserver` throws NSRangeException ("not
+/// registered as an observer"), seen as EXC_BREAKPOINT on close
+/// (emilk/egui#2768). Swallowing that one exception inside `invalidate` makes
+/// the stale removal the no-op it was meant to be; the rest of the original
+/// implementation still runs. The class is private: if Apple renames it the
+/// guard is simply not installed.
+fn guard_touch_bar_finder() {
+    type Invalidate = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
+    static ORIGINAL: std::sync::OnceLock<Invalidate> = std::sync::OnceLock::new();
+
+    /// The AppKit bug raises `NSRangeException` when the finder removes an
+    /// observer already gone. Any other exception is a real failure and must
+    /// keep its abort rather than being hidden by the guard.
+    fn is_stale_observer_exception(exception: &objc2::exception::Exception) -> bool {
+        if !exception.class().responds_to(objc2::sel!(name)) {
+            return false;
+        }
+        let name: Option<objc2::rc::Retained<objc2::runtime::NSObject>> =
+            unsafe { objc2::msg_send![exception, name] };
+        let Some(name) = name else {
+            return false;
+        };
+        if !name.class().responds_to(objc2::sel!(UTF8String)) {
+            return false;
+        }
+        let utf8: *const std::ffi::c_char = unsafe { objc2::msg_send![&*name, UTF8String] };
+        !utf8.is_null()
+            && unsafe { std::ffi::CStr::from_ptr(utf8) }.to_bytes() == b"NSRangeException"
+    }
+
+    unsafe extern "C-unwind" fn guarded(this: *mut AnyObject, cmd: Sel) {
+        let Some(original) = ORIGINAL.get() else {
+            return;
+        };
+        let Err(exception) = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+            original(this, cmd)
+        })) else {
+            return;
+        };
+        if exception
+            .as_deref()
+            .is_some_and(is_stale_observer_exception)
+        {
+            log::warn!("Touch Bar finder hit a stale responder registration; ignored it");
+        } else if let Some(exception) = exception {
+            objc2::exception::throw(exception);
+        } else {
+            log::warn!("Touch Bar finder threw a nil exception; ignored it");
+        }
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let Some(class) = AnyClass::get(c"_NSTouchBarFinderObservation") else {
+            return;
+        };
+        let Some(method) = class.instance_method(objc2::sel!(invalidate)) else {
+            return;
+        };
+        let _ = ORIGINAL.set(std::mem::transmute::<Imp, Invalidate>(
+            method.implementation(),
+        ));
+        method.set_implementation(std::mem::transmute::<Invalidate, Imp>(guarded));
+    });
+}
+
 pub fn attach(ctx: &egui::Context) {
     ctx.add_plugin(MenuInput(Arc::clone(&EDIT_EVENTS)));
     // Layout tests use headless contexts on test threads, without an NSApp.
     if objc2::MainThreadMarker::new().is_none() {
         return;
     }
+    guard_touch_bar_finder();
     *REPAINT.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if native_edit(&event.id.0) {

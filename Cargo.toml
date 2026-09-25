@@ -164,7 +164,7 @@ tray-icon = { version = "0.24", default-features = false }
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 # Pumps AppKit without a window. The status item and Dock reopen callback must
 # stay on the main thread.
-objc2 = "0.6"
+objc2 = { version = "0.6", features = ["exception"] }
 raw-window-handle = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSButton", "NSControl", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSText", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSDateFormatter", "NSFormatter", "NSGeometry", "NSLocale", "NSObjCRuntime", "NSRunLoop", "NSString"] }

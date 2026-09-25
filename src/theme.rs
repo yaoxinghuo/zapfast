@@ -188,9 +188,9 @@ pub fn bold(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name(INTER_BOLD.into()))
 }
 
-/// Installs fonts, icons, and base style.
-pub fn install(ctx: &egui::Context) {
-    install_fonts(ctx);
+/// Installs the selected fonts, icons, and image loaders.
+pub fn install(ctx: &egui::Context, selected: Option<&str>) {
+    install_fonts(ctx, selected);
     register_icons(ctx);
     egui_extras::install_image_loaders(ctx);
     // Drop the raw bytes and the decoded pixels once a texture is on the GPU.
@@ -300,7 +300,14 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     ctx.set_global_style(style);
 }
 
-fn install_fonts(ctx: &egui::Context) {
+/// Applies an installed text family, retaining Inter and script fallbacks.
+pub fn install_fonts(ctx: &egui::Context, selected: Option<&str>) {
+    ctx.set_fonts(font_definitions(
+        selected.and_then(crate::system_fonts::selected),
+    ));
+}
+
+fn font_definitions(selected: Option<Vec<egui::FontData>>) -> egui::FontDefinitions {
     use egui::epaint::text::VariationCoords;
     use egui::{FontData, FontDefinitions, FontFamily};
     use std::sync::Arc;
@@ -339,6 +346,20 @@ fn install_fonts(ctx: &egui::Context) {
         fonts.families.insert(FontFamily::Name(name.into()), family);
     }
 
+    // One bundled pan-CJK face comes first so every ideograph, kana, and
+    // hangul syllable shares the same metrics. The system scan can otherwise
+    // pick a different family per script — on macOS a Japanese Hiragino cut
+    // wins the '中' probe while missing simplified-only glyphs such as '为',
+    // which then land on the next fallback at a different size and baseline,
+    // leaving lines visibly uneven.
+    let cjk = include_bytes!("../assets/fonts/NotoSansCJKsc-Regular.otf");
+    fonts
+        .font_data
+        .insert("cjk".to_owned(), Arc::new(FontData::from_static(cjk)));
+    for family in fonts.families.values_mut() {
+        family.push("cjk".to_owned());
+    }
+
     // Append system fallbacks after Inter and emoji fonts.
     for font in crate::system_fonts::fallbacks() {
         let mut data = FontData::from_static(&font.bytes);
@@ -350,7 +371,25 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
 
-    ctx.set_fonts(fonts);
+    if let Some(weights) = selected {
+        for ((family, name), data) in [
+            (FontFamily::Proportional, "custom-regular"),
+            (FontFamily::Name(INTER_MEDIUM.into()), "custom-medium"),
+            (FontFamily::Name(INTER_SEMIBOLD.into()), "custom-semibold"),
+            (FontFamily::Name(INTER_BOLD.into()), "custom-bold"),
+        ]
+        .into_iter()
+        .zip(weights)
+        {
+            fonts.font_data.insert(name.into(), Arc::new(data));
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .insert(0, name.into());
+        }
+    }
+    fonts
 }
 
 macro_rules! icons {
@@ -1015,9 +1054,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_weights_keep_inter_and_language_fallbacks_and_leave_code_alone() {
+        let default = font_definitions(None);
+        let custom = font_definitions(Some(
+            (0..4)
+                .map(|_| {
+                    egui::FontData::from_static(include_bytes!("../assets/fonts/InterVariable.ttf"))
+                })
+                .collect(),
+        ));
+        for family in [
+            egui::FontFamily::Proportional,
+            egui::FontFamily::Name(INTER_MEDIUM.into()),
+            egui::FontFamily::Name(INTER_SEMIBOLD.into()),
+            egui::FontFamily::Name(INTER_BOLD.into()),
+        ] {
+            assert!(custom.families[&family][0].starts_with("custom-"));
+            assert_eq!(custom.families[&family][1..], default.families[&family]);
+        }
+        assert_eq!(
+            custom.families[&egui::FontFamily::Monospace],
+            default.families[&egui::FontFamily::Monospace]
+        );
+    }
+
+    #[test]
     fn inter_figures_are_tabular() {
         let ctx = egui::Context::default();
-        install(&ctx);
+        install(&ctx, None);
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let width = |text: &str| {
                 ui.painter()

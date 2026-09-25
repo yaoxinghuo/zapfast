@@ -1442,6 +1442,7 @@ pub enum Action {
     SetCustomTheme(String),
     SetWallpaperColor(crate::settings::WallpaperColor),
     SetWallpaperDoodles(bool),
+    SetFont(Option<String>),
     ReloadThemes,
     OpenThemesFolder,
     SettingsChanged,

@@ -1,7 +1,8 @@
 //! Windows notification-area and macOS menu-bar item.
 //!
-//! Windows uses a separate message-loop thread. macOS creates the item on the
-//! main thread and pumps AppKit events while no window exists.
+//! Windows uses a separate message-loop thread. macOS creates no status item:
+//! the menu-bar icon stays hidden, and the Dock icon reopens the window while
+//! the app runs headless.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -11,7 +12,9 @@ use std::time::Duration;
 use tray_icon::menu::MenuEvent;
 #[cfg(windows)]
 use tray_icon::menu::MenuId;
+#[cfg(windows)]
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+#[cfg(windows)]
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +26,9 @@ pub enum TrayCommand {
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+#[cfg(windows)]
 const SHOW: &str = "show";
+#[cfg(windows)]
 const QUIT: &str = "quit";
 
 #[cfg(windows)]
@@ -36,36 +41,28 @@ fn command_for(id: &MenuId) -> Option<TrayCommand> {
 }
 
 /// Tray item lifetime guard.
+#[cfg(windows)]
 struct Item {
     _icon: TrayIcon,
 }
 
 /// Creates the tray item and forwards its events to `sender`.
+#[cfg(windows)]
 fn build(sender: Sender<TrayCommand>, wake: Wake) -> Result<Item, Box<dyn std::error::Error>> {
     let size = 32u32;
-    #[cfg(not(target_os = "macos"))]
     let icon = Icon::from_rgba(crate::util::app_icon_rgba(size as usize), size, size)?;
-    // Use a macOS template image so the system selects its color.
-    #[cfg(target_os = "macos")]
-    let icon = Icon::from_rgba(crate::util::tray_template_rgba(size as usize), size, size)?;
     let menu = Menu::new();
     menu.append_items(&[
         &MenuItem::with_id(SHOW, "Show or hide ZapFast", true, None),
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(QUIT, "Quit", true, None),
     ])?;
-    let builder = TrayIconBuilder::new()
+    let icon = TrayIconBuilder::new()
         .with_icon(icon)
         .with_tooltip("ZapFast")
-        .with_menu(Box::new(menu));
-    // Left-click toggles the window; right-click opens the menu.
-    #[cfg(target_os = "macos")]
-    let builder = builder
-        .with_icon_as_template(true)
-        .with_menu_on_left_click(false);
-    let icon = builder.build()?;
+        .with_menu(Box::new(menu))
+        .build()?;
 
-    #[cfg(windows)]
     {
         let menu_sender = sender.clone();
         let menu_wake = Arc::clone(&wake);
@@ -184,8 +181,7 @@ mod host {
     use super::*;
 
     thread_local! {
-        /// Main-thread-only macOS status item.
-        pub static ITEM: RefCell<Option<Item>> = const { RefCell::new(None) };
+        /// Sends `TrayCommand::Show` when the Dock icon is clicked headless.
         pub(super) static REOPEN: RefCell<Option<Sender<TrayCommand>>> = const { RefCell::new(None) };
     }
 
@@ -241,22 +237,17 @@ mod host {
         }
     }
 
-    /// Creates the item once on the main thread.
-    pub fn create(sender: Sender<TrayCommand>, wake: Wake) {
+    /// Installs the Dock reopen handler once on the main thread.
+    ///
+    /// No status item is created: the menu-bar icon stays hidden. Clicking the
+    /// Dock icon still reopens the window while the app runs headless.
+    pub fn create(sender: Sender<TrayCommand>, _wake: Wake) {
         let Some(mtm) = MainThreadMarker::new() else {
-            log::warn!("the status item can only be made on the main thread");
+            log::warn!("the Dock reopen handler can only be installed on the main thread");
             return;
         };
-        REOPEN.with(|slot| *slot.borrow_mut() = Some(sender.clone()));
+        REOPEN.with(|slot| *slot.borrow_mut() = Some(sender));
         install_reopen_handler(&NSApplication::sharedApplication(mtm));
-        match build(sender, wake) {
-            Ok(item) => ITEM.with(|slot| *slot.borrow_mut() = Some(item)),
-            Err(error) => log::info!("no status item: {error}"),
-        }
-    }
-
-    pub fn exists() -> bool {
-        ITEM.with(|slot| slot.borrow().is_some())
     }
 
     pub fn activate() {
@@ -296,7 +287,7 @@ mod host {
 #[cfg(target_os = "macos")]
 pub struct TrayService {
     commands: Receiver<TrayCommand>,
-    /// State kept until the first window can create the item.
+    /// State kept until the first window can install the Dock reopen handler.
     pending: Option<(Sender<TrayCommand>, Wake)>,
 }
 
@@ -315,17 +306,15 @@ impl TrayService {
         self.commands.try_iter().collect()
     }
 
-    /// Creates the item if needed and activates the application.
+    /// Installs the Dock reopen handler and activates the application.
     pub fn attach(&mut self) {
         if let Some((sender, wake)) = self.pending.take() {
             host::create(sender, wake);
         }
-        if host::exists() {
-            host::activate();
-        }
+        host::activate();
     }
 
-    /// Keeps the status item and Dock icon available without a window.
+    /// Keeps the Dock icon responsive without a window.
     pub fn hidden(&mut self) {}
 }
 

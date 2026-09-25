@@ -17,3 +17,12 @@ uvx --from opentype-feature-freezer pyftfeatfreeze -f tnum \
 
 The freeze changes only which glyph a codepoint maps to. The font names,
 version, the `opsz` and `wght` axes, and all metrics stay as upstream.
+
+# Noto Sans CJK
+
+`NotoSansCJKsc-Regular.otf` is the Simplified Chinese cut of Noto Sans CJK
+(<https://github.com/notofonts/noto-cjk>, SIL OFL 1.1, see
+`NotoSansCJK-LICENSE.txt`). It is bundled as the first fallback for CJK
+scripts so every ideograph, kana, and hangul syllable renders with one set of
+metrics: the system-font scan can otherwise mix families in one line, which
+leaves characters at visibly different sizes and baselines.

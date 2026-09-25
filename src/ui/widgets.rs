@@ -801,7 +801,7 @@ mod tests {
     /// The knob radius and the track outline a switch paints in one state.
     fn switch_shapes(on: bool) -> (f32, f32) {
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
+        crate::theme::install(&ctx, None);
         let mut value = on;
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             switch(ui, &crate::theme::Palette::light(), &mut value);

@@ -585,7 +585,7 @@ mod idle_tests {
         app.sync_percent = Some(42);
         app.open_chat = None;
         let ctx = egui::Context::default();
-        theme::install(&ctx);
+        theme::install(&ctx, None);
         let mut delay = std::time::Duration::ZERO;
         for index in 0..6 {
             let mut output = ctx.run_ui(
@@ -620,7 +620,7 @@ mod idle_tests {
         app.link = LinkStatus::Connected;
         app.toast_error("Could not record: no microphone");
         let ctx = egui::Context::default();
-        theme::install(&ctx);
+        theme::install(&ctx, None);
         let mut delay = std::time::Duration::ZERO;
         for index in 0..6 {
             let mut output = ctx.run_ui(
@@ -683,7 +683,7 @@ mod idle_tests {
         app.conversations.insert(chat.id.clone(), conversation);
 
         let ctx = egui::Context::default();
-        theme::install(&ctx);
+        theme::install(&ctx, None);
         let mut delay = std::time::Duration::ZERO;
         for index in 0..6 {
             let mut output = ctx.run_ui(
@@ -742,7 +742,7 @@ mod idle_tests {
         app.conversations.insert(chat.id.clone(), conversation);
 
         let ctx = egui::Context::default();
-        theme::install(&ctx);
+        theme::install(&ctx, None);
 
         // Open chat initially
         app.open_chat = Some(chat.id.clone());

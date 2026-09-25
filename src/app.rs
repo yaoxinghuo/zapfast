@@ -162,6 +162,7 @@ pub struct App {
     pub settings: Settings,
     /// Resolved interface language, from the setting or the system locale.
     pub locale: Locale,
+    pub font_search: String,
     settings_dirty: bool,
     last_settings_save: Instant,
     pub backend: Backend,
@@ -583,6 +584,7 @@ impl App {
             dirs,
             settings,
             locale,
+            font_search: String::new(),
             settings_dirty: false,
             last_settings_save: Instant::now(),
             backend,
@@ -933,7 +935,7 @@ impl App {
         ctx.add_plugin(crate::ui::conversation::SelectionLeash::new(
             std::sync::Arc::clone(&self.selection_view),
         ));
-        crate::theme::install(ctx);
+        crate::theme::install(ctx, self.settings.font_family.as_deref());
         // Use a faster wheel speed for short chat rows.
         ctx.options_mut(|options| options.input_options.line_scroll_speed = 120.0);
         // Load and index the color emoji font outside the frame loop.
@@ -4223,6 +4225,12 @@ impl App {
                     });
                 }
             }
+            Action::SetFont(family) => {
+                self.settings.font_family = family;
+                theme::install_fonts(ctx, self.settings.font_family.as_deref());
+                ctx.request_repaint();
+                self.mark_settings_dirty();
+            }
             Action::SetTheme(choice) => {
                 self.settings.theme = choice;
                 self.settings.custom_theme = None;
@@ -5762,6 +5770,26 @@ mod tests {
         app.apply_actions(&ctx);
         assert!(app.chat(&id).expect("chat").archived);
         assert!(app.open_chat.is_none(), "the confirmed archive closes it");
+    }
+
+    #[test]
+    fn font_choice_survives_window_recreation_and_can_reset() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.apply(Action::SetFont(Some("Missing fixture font".into())), &ctx);
+        assert_eq!(
+            app.settings.font_family.as_deref(),
+            Some("Missing fixture font")
+        );
+        assert!(app.settings_dirty);
+        app.attach(&egui::Context::default());
+        assert_eq!(
+            app.settings.font_family.as_deref(),
+            Some("Missing fixture font")
+        );
+        app.apply(Action::SetFont(None), &ctx);
+        assert!(app.settings.font_family.is_none());
     }
 
     #[test]
