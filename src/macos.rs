@@ -121,44 +121,26 @@ fn guard_touch_bar_finder() {
     type Invalidate = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
     static ORIGINAL: std::sync::OnceLock<Invalidate> = std::sync::OnceLock::new();
 
-    /// The AppKit bug raises `NSRangeException` when the finder removes an
-    /// observer already gone. Any other exception is a real failure and must
-    /// keep its abort rather than being hidden by the guard.
-    fn is_stale_observer_exception(exception: &objc2::exception::Exception) -> bool {
-        if !exception.class().responds_to(objc2::sel!(name)) {
-            return false;
-        }
-        let name: Option<objc2::rc::Retained<objc2::runtime::NSObject>> =
-            unsafe { objc2::msg_send![exception, name] };
-        let Some(name) = name else {
-            return false;
-        };
-        if !name.class().responds_to(objc2::sel!(UTF8String)) {
-            return false;
-        }
-        let utf8: *const std::ffi::c_char = unsafe { objc2::msg_send![&*name, UTF8String] };
-        !utf8.is_null()
-            && unsafe { std::ffi::CStr::from_ptr(utf8) }.to_bytes() == b"NSRangeException"
+    // The @try/@catch is compiled C (build_support/touch_bar_guard.m): an
+    // Objective-C exception has to unwind through every frame up to the
+    // catcher, and Rust frames emit no unwind tables under the release
+    // profile's `panic = "abort"`, so `objc2::exception::catch` aborts the
+    // process before it can see the exception.
+    unsafe extern "C" {
+        /// Returns false when it swallowed the stale-observer NSRangeException.
+        fn zapfast_call_swallowing_range_error(
+            imp: Invalidate,
+            object: *mut AnyObject,
+            selector: Sel,
+        ) -> bool;
     }
 
     unsafe extern "C-unwind" fn guarded(this: *mut AnyObject, cmd: Sel) {
         let Some(original) = ORIGINAL.get() else {
             return;
         };
-        let Err(exception) = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-            original(this, cmd)
-        })) else {
-            return;
-        };
-        if exception
-            .as_deref()
-            .is_some_and(is_stale_observer_exception)
-        {
+        if unsafe { !zapfast_call_swallowing_range_error(*original, this, cmd) } {
             log::warn!("Touch Bar finder hit a stale responder registration; ignored it");
-        } else if let Some(exception) = exception {
-            objc2::exception::throw(exception);
-        } else {
-            log::warn!("Touch Bar finder threw a nil exception; ignored it");
         }
     }
 
