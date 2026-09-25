@@ -2245,15 +2245,11 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     ],
                 );
             }
-            "nosidebar" => app.sidebar_visible = false,
+            // The chat list collapsed to avatars with unread badges.
+            "nosidebar" | "rail" => app.sidebar_visible = false,
             // A list wide enough for the whole chip row, which scrolls out of
             // sight at the default width.
             "wide" => app.settings.sidebar_width = 560.0,
-            // The chat list collapsed to avatars with unread badges.
-            "rail" => {
-                app.settings.collapse_chat_list = true;
-                app.sidebar_visible = false;
-            }
             "search" => {
                 app.search = "do".into();
                 let mut hits = Vec::new();
@@ -2336,11 +2332,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.composer = "Look at these".into();
             }
             "archived" => app.show_archived = true,
-            "labels" => labels_sample(app),
-            "label-chips" => {
-                labels_sample(app);
-                app.settings.label_chips = true;
-            }
+            "labels" | "label-chips" => labels_sample(app),
             "label-filter" => {
                 labels_sample(app);
                 app.label_filter = Some("label-work".into());
@@ -3845,6 +3837,8 @@ mod tests {
             "rtl",
             "disappearing",
             "settings",
+            "settings-search=Notifications",
+            "settings-search=System",
             "wallpaper",
             "wallpaper,light",
             "update",

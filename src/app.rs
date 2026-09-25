@@ -380,6 +380,8 @@ pub struct App {
     pub new_contact_name: String,
     pub new_contact_last: String,
     pub new_contact_pending: bool,
+    /// The new-contact dialog's "Save to phone" box.
+    pub new_contact_to_phone: bool,
     /// Phone number entered for pairing.
     pub pair_phone: String,
     pub sidebar_visible: bool,
@@ -571,6 +573,16 @@ impl App {
         )
     }
 
+    /// Starts without a window (`--start-hidden`). The link and the archive
+    /// start now: they otherwise wait for a first frame, which a hidden start
+    /// only draws once the tray or another launch shows the window.
+    pub fn start_hidden(&mut self) {
+        self.hide_intent = true;
+        if let Some(startup) = self.backend.take_startup() {
+            let _ = startup.send(());
+        }
+    }
+
     fn with_backend(dirs: AppDirs, settings: Settings, backend: Backend, waker: Waker) -> Self {
         let palette = settings
             .cached_palette()
@@ -715,6 +727,7 @@ impl App {
             new_contact_name: String::new(),
             new_contact_last: String::new(),
             new_contact_pending: false,
+            new_contact_to_phone: true,
             pair_phone: String::new(),
             sidebar_visible: true,
             show_archived: false,
@@ -965,16 +978,13 @@ impl App {
         self.link.is_connected()
     }
 
-    /// How the chat list is drawn right now. Hidden chats either leave the
-    /// window entirely or collapse to an icon column, depending on settings.
+    /// How the chat list is drawn right now. Hiding it leaves a column of
+    /// avatars with unread badges.
     pub fn sidebar_mode(&self) -> SidebarDisplayMode {
         if self.sidebar_visible {
-            return SidebarDisplayMode::Expanded;
-        }
-        if self.settings.collapse_chat_list {
-            SidebarDisplayMode::CollapsedIconsOnly
+            SidebarDisplayMode::Expanded
         } else {
-            SidebarDisplayMode::Hidden
+            SidebarDisplayMode::CollapsedIconsOnly
         }
     }
 
@@ -1223,12 +1233,8 @@ impl App {
         let saved = present(contact.and_then(|contact| contact.full_name.as_deref()));
         let called = present(contact.and_then(|contact| contact.push_name.as_deref()))
             .or_else(|| present(hint));
-        let (first, second) = if self.settings.names_from_contacts {
-            (saved, called.map(|name| format!("~{name}")))
-        } else {
-            (called, saved)
-        };
-        if let Some(name) = first.or(second) {
+        // Saved names first, as WhatsApp does; a profile name wears a tilde.
+        if let Some(name) = saved.or_else(|| called.map(|name| format!("~{name}"))) {
             return name;
         }
         if let Some(chat) = self.chat(id)
@@ -3989,6 +3995,7 @@ impl App {
                     self.pair_phone.clear();
                 }
                 if dialog == Dialog::NewContact {
+                    self.new_contact_to_phone = self.settings.save_contacts_to_phone;
                     self.new_contact_phone.clear();
                     self.new_contact_name.clear();
                     self.new_contact_last.clear();
@@ -4021,24 +4028,30 @@ impl App {
                     to_phone: self.settings.save_contacts_to_phone,
                 });
             }
-            Action::NewContact { phone, first, last } => {
+            Action::NewContact {
+                phone,
+                first,
+                last,
+                to_phone,
+            } => {
                 self.new_contact_pending = true;
                 let (full_name, first_name) = compose_name(&first, &last);
+                // The dialog's choice starts the next one.
+                if let Some(to_phone) = to_phone
+                    && full_name.is_some()
+                    && to_phone != self.settings.save_contacts_to_phone
+                {
+                    self.settings.save_contacts_to_phone = to_phone;
+                    self.mark_settings_dirty();
+                }
                 self.backend.send(Command::NewContact {
                     phone,
                     full_name,
                     first_name,
-                    to_phone: self.settings.save_contacts_to_phone,
+                    to_phone: to_phone.unwrap_or(self.settings.save_contacts_to_phone),
                 });
             }
-            Action::ToggleSidebar => match self.sidebar_mode() {
-                // Hiding is the only step out of the full list. With the
-                // preference on, it collapses to avatars instead of leaving.
-                SidebarDisplayMode::Expanded => self.sidebar_visible = false,
-                SidebarDisplayMode::CollapsedIconsOnly | SidebarDisplayMode::Hidden => {
-                    self.sidebar_visible = true;
-                }
-            },
+            Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
             Action::SetChatFilter(filter) => {
                 if self.locked_folder {
                     self.close_locked_folder();
@@ -4289,8 +4302,8 @@ impl App {
                     }
                 });
             }
-            Action::HideShortcutHints => {
-                self.settings.show_shortcut_hints = false;
+            Action::SetShortcutHints(show) => {
+                self.settings.show_shortcut_hints = show;
                 self.mark_settings_dirty();
             }
             Action::DismissChatLockHint => {
@@ -4569,11 +4582,11 @@ impl App {
             .voice_wanted
             .as_ref()
             .is_some_and(|(_, _, since)| since.elapsed() < VOICE_FETCH_HOLD);
-        self.recording.is_some() && self.settings.pause_media_while_recording
-            || self.settings.pause_media_while_playing
-                && (self.player.is_playing()
-                    || fetching_next
-                    || self.video.is_active() && !self.video.muted())
+        self.settings.pause_other_media
+            && (self.recording.is_some()
+                || self.player.is_playing()
+                || fetching_next
+                || self.video.is_active() && !self.video.muted())
     }
 
     /// Keeps the backend following receipts for exactly the group message
@@ -5290,24 +5303,52 @@ mod tests {
     }
 
     #[test]
-    fn hiding_the_chat_list_collapses_it_only_when_asked() {
+    fn the_new_contact_box_remembers_whether_to_save_to_the_phone() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        let to_phone = |commands: &mut tokio::sync::mpsc::UnboundedReceiver<Command>| {
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .find_map(|command| match command {
+                    Command::NewContact { to_phone, .. } => Some(to_phone),
+                    _ => None,
+                })
+                .expect("the number is checked")
+        };
+        app.apply(Action::ShowDialog(Dialog::NewContact), &ctx);
+        assert!(app.new_contact_to_phone, "on until turned off");
+        let add = |to_phone, first: &str| Action::NewContact {
+            phone: "15550002222".into(),
+            first: first.into(),
+            last: String::new(),
+            to_phone,
+        };
+        app.apply(add(Some(false), "Ada"), &ctx);
+        assert!(!to_phone(&mut commands));
+        assert!(!app.settings.save_contacts_to_phone);
+        assert!(app.settings_dirty);
+        app.apply(Action::ShowDialog(Dialog::NewContact), &ctx);
+        assert!(!app.new_contact_to_phone, "the next dialog starts from it");
+        // Opening a chat without a name saves nothing, so it keeps the choice.
+        app.apply(add(Some(true), ""), &ctx);
+        assert!(to_phone(&mut commands));
+        assert!(!app.settings.save_contacts_to_phone);
+        // A shared contact's Add follows the last choice.
+        app.apply(add(None, "Bob"), &ctx);
+        assert!(!to_phone(&mut commands));
+    }
+
+    #[test]
+    fn hiding_the_chat_list_always_collapses_it_to_avatars() {
         let mut app = app();
         let ctx = egui::Context::default();
         assert_eq!(app.sidebar_mode(), SidebarDisplayMode::Expanded);
         app.apply(Action::ToggleSidebar, &ctx);
         assert_eq!(
             app.sidebar_mode(),
-            SidebarDisplayMode::Hidden,
-            "without the preference, hiding removes the list"
-        );
-        app.apply(Action::ToggleSidebar, &ctx);
-        assert_eq!(app.sidebar_mode(), SidebarDisplayMode::Expanded);
-        app.settings.collapse_chat_list = true;
-        app.apply(Action::ToggleSidebar, &ctx);
-        assert_eq!(
-            app.sidebar_mode(),
             SidebarDisplayMode::CollapsedIconsOnly,
-            "the same button collapses the list instead"
+            "hiding the list leaves the avatar column"
         );
         app.apply(Action::ToggleSidebar, &ctx);
         assert_eq!(
@@ -5717,6 +5758,22 @@ mod tests {
         assert_eq!(app.toasts.len(), 1);
         assert_eq!(app.toasts[0].message, "Failed to copy image");
         assert_eq!(app.toasts[0].kind, ToastKind::Error);
+    }
+
+    #[test]
+    fn a_hidden_start_starts_the_backend_without_a_frame() {
+        let root = tempfile::tempdir().unwrap();
+        let (backend, mut started) = Backend::detached_with_startup();
+        let mut app = App::with_backend(
+            AppDirs::under(root.path()),
+            Settings::default(),
+            backend,
+            Waker::default(),
+        );
+        assert!(started.try_recv().is_err(), "nothing starts before asked");
+        app.start_hidden();
+        assert!(app.hide_intent);
+        assert_eq!(started.try_recv(), Ok(()));
     }
 
     #[test]
@@ -6900,7 +6957,7 @@ mod tests {
         let chat = "1@s.whatsapp.net";
         app.chats = vec![Chat::new(chat.into(), "Ada".into())];
         app.open_chat = Some(chat.into());
-        app.settings.pause_media_while_playing = true;
+        app.settings.pause_other_media = true;
         app.conversations.entry(chat.into()).or_default().merge(
             vec![
                 voice(chat, "first", 1, Some("first.ogg")),
@@ -7035,7 +7092,7 @@ mod tests {
         let mut app = app();
         let chat = "1@s.whatsapp.net";
         app.open_chat = Some(chat.into());
-        app.settings.pause_media_while_playing = true;
+        app.settings.pause_other_media = true;
         app.conversations
             .entry(chat.into())
             .or_default()
@@ -8726,9 +8783,14 @@ mod tests {
         let ctx = egui::Context::default();
         app.composer = "Unsent draft".into();
         app.focus_search = true;
-        app.apply(Action::HideShortcutHints, &ctx);
+        app.apply(Action::SetShortcutHints(false), &ctx);
         assert!(!app.settings.show_shortcut_hints);
         assert!(app.settings_dirty);
+        app.apply(Action::SetShortcutHints(true), &ctx);
+        assert!(
+            app.settings.show_shortcut_hints,
+            "the shortcuts dialog brings them back"
+        );
         app.apply(Action::FocusComposer, &ctx);
         assert!(app.focus_composer);
         assert!(!app.focus_search);
@@ -8864,13 +8926,10 @@ mod name_tests {
         // Duplicate entries for the same identity must not inflate the count.
         chat.participants.push(chat.participants[0].clone());
         chat.participants.push(app.me.clone().unwrap());
-        for saved_names in [false, true] {
-            app.settings.names_from_contacts = saved_names;
-            assert_eq!(app.participant_names(&chat), "Andrea x3, Giacomo, You");
-            assert_eq!(app.chat_title(&chat), app.participant_names(&chat));
-            chat.name.clear();
-            assert_eq!(app.chat_title(&chat), app.participant_names(&chat));
-        }
+        assert_eq!(app.participant_names(&chat), "Andrea x3, Giacomo, You");
+        assert_eq!(app.chat_title(&chat), app.participant_names(&chat));
+        chat.name.clear();
+        assert_eq!(app.chat_title(&chat), app.participant_names(&chat));
         chat.name = "Group".into();
         chat.group_subject_known = true;
         assert_eq!(
@@ -8890,16 +8949,13 @@ mod name_tests {
     }
 
     #[test]
-    fn the_setting_picks_the_source_and_the_other_fills_in() {
-        let mut app = app();
+    fn saved_names_come_first_and_profile_names_fill_in() {
+        let app = app();
         assert_eq!(app.display_name("1@s.whatsapp.net"), "Ada Lovelace");
         assert_eq!(app.display_name("2@s.whatsapp.net"), "~Bob");
-        app.settings.names_from_contacts = false;
-        assert_eq!(app.display_name("1@s.whatsapp.net"), "Ada");
-        assert_eq!(app.display_name("2@s.whatsapp.net"), "Bob");
         assert_eq!(
             app.display_name_or("3@s.whatsapp.net", Some("Cy")),
-            "Cy",
+            "~Cy",
             "a name the message carried, for someone unknown"
         );
     }

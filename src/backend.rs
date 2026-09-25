@@ -998,6 +998,15 @@ impl Backend {
         )
     }
 
+    /// A detached backend whose startup permit the test can watch.
+    #[cfg(test)]
+    pub(crate) fn detached_with_startup() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (mut backend, _) = Self::detached();
+        let (startup, started) = tokio::sync::oneshot::channel();
+        backend.startup = Some(startup);
+        (backend, started)
+    }
+
     /// Records commands without a runtime or network connection.
     #[cfg(test)]
     pub(crate) fn recording() -> (Self, mpsc::UnboundedReceiver<Command>) {

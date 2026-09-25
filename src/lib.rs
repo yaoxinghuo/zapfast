@@ -43,5 +43,4 @@ pub mod updates;
 pub mod util;
 pub mod video;
 pub mod voice;
-pub mod vsync;
 pub mod wallpaper;

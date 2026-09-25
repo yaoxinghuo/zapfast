@@ -173,10 +173,11 @@ mod host {
     use std::cell::RefCell;
     use std::ffi::CString;
 
-    use objc2::runtime::{AnyClass, AnyObject, Bool, MethodImplementation, Sel};
-    use objc2::{Encode, MainThreadMarker, sel};
-    use objc2_app_kit::{NSApplication, NSEventMask};
-    use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject, Bool, MethodImplementation, NSObject, Sel};
+    use objc2::{Encode, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+    use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::{NSObjectNSDelayedPerforming, NSPoint};
 
     use super::*;
 
@@ -259,28 +260,73 @@ mod host {
         app.activateIgnoringOtherApps(true);
     }
 
-    /// Pumps AppKit events for `duration` while headless.
+    define_class!(
+        /// Ends a headless `-[NSApplication run]` when its time slice is over.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "ZapFastHeadlessStop"]
+        struct HeadlessStop;
+
+        impl HeadlessStop {
+            #[unsafe(method(stopRun:))]
+            fn stop_run(&self, _sender: Option<&AnyObject>) {
+                let app = NSApplication::sharedApplication(self.mtm());
+                app.stop(None);
+                // `stop:` takes effect after the next event, and a timer is
+                // not one, so post a no-op event for `run` to return on.
+                if let Some(event) =
+                    NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                        NSEventType::ApplicationDefined,
+                        NSPoint::new(0.0, 0.0),
+                        NSEventModifierFlags::empty(),
+                        0.0,
+                        0,
+                        None,
+                        0,
+                        0,
+                        0,
+                    )
+                {
+                    app.postEvent_atStart(&event, true);
+                }
+            }
+        }
+    );
+
+    impl HeadlessStop {
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(());
+            // SAFETY: `NSObject`'s designated initializer, called once.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    /// Runs AppKit's event loop for `duration` while headless.
+    ///
+    /// `-[NSApplication run]` catches an Objective-C exception raised while
+    /// an event is handled and reports it, as it does while a window is
+    /// open. A hand-written `nextEventMatchingMask:`/`sendEvent:` loop let
+    /// such an exception unwind into Rust, which aborts the process (#199).
     pub fn pump(duration: Duration) {
         let Some(mtm) = MainThreadMarker::new() else {
             std::thread::sleep(duration);
             return;
         };
         let app = NSApplication::sharedApplication(mtm);
-        let deadline = NSDate::dateWithTimeIntervalSinceNow(duration.as_secs_f64());
-        // Safety: AppKit defines this immutable extern static.
-        let mode = unsafe { NSDefaultRunLoopMode };
-        loop {
-            let event = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                NSEventMask::Any,
-                Some(&deadline),
-                mode,
-                true,
+        let stop = HeadlessStop::new(mtm);
+        // SAFETY: `stopRun:` is defined above and accepts a nil sender.
+        unsafe {
+            stop.performSelector_withObject_afterDelay(
+                sel!(stopRun:),
+                None,
+                duration.as_secs_f64(),
             );
-            match event {
-                Some(event) => app.sendEvent(&event),
-                None => break,
-            }
         }
+        app.run();
+        // Another `stop:` may end the run early; a leftover request must not
+        // stop the next window's event loop.
+        // SAFETY: `stop` is the target the request was scheduled on.
+        unsafe { NSObject::cancelPreviousPerformRequestsWithTarget(&stop) };
     }
 }
 

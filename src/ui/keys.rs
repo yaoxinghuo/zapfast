@@ -281,7 +281,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
         "Ctrl+V",
         "Paste text, or stage a picture from the clipboard",
     ),
-    ("Ctrl+B", "Show or hide the chat list"),
+    ("Ctrl+B", "Collapse or expand the chat list"),
     ("Ctrl+End", "Jump to the newest message"),
     ("Ctrl+,", "Settings"),
     ("Ctrl++ / Ctrl+-", "Zoom in / out"),
@@ -294,7 +294,9 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
 /// Uses Command and Option labels on macOS.
 pub fn label(keys: &str) -> String {
     if cfg!(target_os = "macos") {
-        keys.replace("Ctrl", "⌘").replace("Alt", "⌥")
+        keys.replace("Ctrl", "⌘")
+            .replace("Strg", "⌘")
+            .replace("Alt", "⌥")
     } else {
         keys.to_owned()
     }

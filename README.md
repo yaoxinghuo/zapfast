@@ -183,9 +183,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   Windows, music and other media playing in other apps pause while you record
   or play a voice message, or watch a video with sound, and resume afterwards;
   only players that were
-  playing are resumed. Two switches in Settings turn this off for recording
-  and for playback. Linux uses MPRIS, so any player that implements it works;
-  macOS has no public API for this, so the switches are hidden there.
+  playing are resumed. **Pause other media while recording or playing** in
+  Settings turns this off. Linux uses MPRIS, so any player that implements it
+  works; macOS has no public API for this, so the switch is hidden there.
 - **Send messages.** Press Enter to send text and Shift+Enter for a new line.
   You can swap these keys in Settings. The composer is focused when you open
   or return to a conversation; invoking search keeps focus in search, and
@@ -269,9 +269,11 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   background, and tag it with emojis.
   Animated packs remain animated. Packs are stored as WebP files on your
   computer.
-- **Consistent names.** Use names from your address book or public WhatsApp
-  profile names across chats, replies, mentions, and notifications.
-- **Groups.** See members, sender names, and sender pictures. Announcement
+- **Consistent names.** Names from your address book come first, as on the
+  phone, and public WhatsApp profile names (shown with a `~`) fill in, across
+  chats, replies, mentions, and notifications.
+- **Groups.** See members, sender names, and sender pictures (shown in groups
+  only, as on WhatsApp). Announcement
   groups are read-only for non-admins. Clicking a `chat.whatsapp.com` invite
   link shows the group's name, size, and description, and joins it (or sends a
   join request when admins approve members) without leaving ZapFast.
@@ -346,13 +348,14 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   `Ctrl+Shift+[`/`Ctrl+Shift+]` switches chats and
   keeps the active chat visible in the list, `↑` in an empty input edits your
   previous message, `Esc` cancels the current action, `Ctrl+L` focuses the
-  message input, `Ctrl+N` opens New chat, `Ctrl+B` hides or shows the chat
-  list, and `?` (outside text fields) or
+  message input, `Ctrl+N` opens New chat, `Ctrl+B` collapses or expands the
+  chat list, and `?` (outside text fields) or
   `Ctrl+/` opens Keyboard shortcuts (use Command instead of Ctrl on macOS).
   The × at the left of the shortcut hints
-  hides the bar; restore it with **Show shortcut hints** in Settings.
-- **Collapsed chat list.** Turn on **Collapse the chat list to icons** in
-  Settings and hiding the chat list leaves a narrow column of avatars instead.
+  hides the bar; bring it back with **Show shortcut hints under the message
+  box** in the Keyboard shortcuts dialog.
+- **Collapsed chat list.** Hiding the chat list (`Ctrl+B`, or the button beside
+  **New chat**) leaves a narrow column of avatars.
   It shows the same chats as the full list under the current filter, with
   unread badges (dimmed for muted chats); hovering names a chat, clicking opens
   it, and `Ctrl+B` brings the full list back.
@@ -503,7 +506,9 @@ or on its edge, to reply to it (a double-click on its text still selects the
 word). Open Settings from the gear or
 with `Ctrl+,`. The pencil opens **New chat**, with **Message yourself** and
 **+ Add contact** at the top, followed by searchable contacts. Add contact also
-lets you message a new number without saving it. You
+lets you message a new number without saving it. **Also save to your phone's
+contacts** in that dialog adds the contact to your phone's address book too, as
+the phone asks; the next contact starts from your last choice. You
 can also open a group member's contact card. Saved names sync through WhatsApp
 to your phone and linked devices.
 
@@ -592,14 +597,14 @@ English. `Ctrl+F` on the Settings page focuses the field, and `Esc` clears it.
 follows the operating system's language and falls back to English when ZapFast
 has no translation for it. Brazilian Portuguese, German, Spanish, Italian,
 French, and Russian cover the chat list, search, composer, shortcut hints,
-Settings section titles, and dates. Translations are compiled from gettext PO
+Settings, and dates. Translations are compiled from gettext PO
 files at build time, with no runtime parsing or network access. Message
 contents, contact names, logs, and protocol errors are never translated, and
 copied messages keep WhatsApp's `[time, date] Name:` format.
 
 ### Proxy
 
-**Settings > Network > Proxy** sends the WhatsApp connection, media, profile
+**Settings > System > Proxy** sends the WhatsApp connection, media, profile
 pictures, GIF search, Signal sticker imports, and update checks through a proxy. It accepts
 `socks5h://host:port` (the proxy resolves names, as Tor expects),
 `socks5://host:port`, and `http://host:port`, each with an optional

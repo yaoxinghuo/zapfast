@@ -32,7 +32,6 @@ const NOT_SENT_HINT: &str =
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let Some(chat) = app.current_chat().cloned() else {
-        super::standalone_header(app, ui);
         if theme::macos_chrome(ui.ctx()) {
             super::banner(app, ui);
         }
@@ -96,9 +95,6 @@ fn empty(app: &mut App, ui: &mut egui::Ui) {
 fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     let palette = app.palette;
     let title = app.chat_title(chat);
-    // The collapsed list has its own show button and clears the traffic
-    // lights itself; only a fully hidden list leaves both to the header.
-    let sidebar_hidden = app.sidebar_mode() == crate::model::SidebarDisplayMode::Hidden;
     egui::Panel::top("chat-header")
         .show_separator_line(false)
         .frame(
@@ -107,33 +103,13 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 .inner_margin(Margin::symmetric(14, 8)),
         )
         .show(ui, |ui| {
+            // The chat list, expanded or collapsed, clears the traffic lights.
             if theme::macos_chrome(ui.ctx()) {
-                let mut drag = ui.max_rect();
-                if sidebar_hidden {
-                    drag.min.x += theme::traffic_light_inset(ui.ctx());
-                }
-                super::titlebar_drag(ui, drag);
+                super::titlebar_drag(ui, ui.max_rect());
             }
             ui.horizontal(|ui| {
                 // Give both rows a fixed height so their contents align.
                 ui.set_min_height(HEADER_ROW);
-                if sidebar_hidden && theme::macos_chrome(ui.ctx()) {
-                    ui.add_space((theme::traffic_light_inset(ui.ctx()) - 14.0).max(0.0));
-                }
-                if sidebar_hidden
-                    && theme::icon_button(
-                        ui,
-                        Icon::PanelLeft,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Show the chat list (Ctrl+B)",
-                    )
-                    .tab_stop(Stop::Sidebar)
-                    .clicked()
-                {
-                    app.actions.push(Action::ToggleSidebar);
-                }
                 let picture = app.avatar(&chat.id);
                 let (subtitle, color) = subtitle(app, chat);
                 let right_controls = 72.0;
@@ -1266,11 +1242,11 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         13.0,
                         palette.dim,
                         palette.secondary,
-                        crate::i18n::gettext(app.locale, "Hide shortcut hints (restore in Settings)").as_ref(),
+                        crate::i18n::gettext(app.locale, "Hide shortcut hints (bring them back from Keyboard shortcuts)").as_ref(),
                     )
                     .clicked()
                     {
-                        app.actions.push(Action::HideShortcutHints);
+                        app.actions.push(Action::SetShortcutHints(false));
                     }
                     theme::text(ui, &hint, theme::regular(11.0), palette.dim);
                     // Open the shortcut list without consuming typed `?`.
@@ -1530,8 +1506,6 @@ struct View<'a> {
     connected: bool,
     poll_voting: &'a HashSet<(ChatId, String)>,
     interactive_pending: &'a HashSet<(ChatId, String)>,
-    /// Show avatars for all incoming messages, not only groups.
-    pictures: bool,
     anchor: Option<&'a str>,
     /// Demo/test: keep this message's context menu open.
     open_menu: Option<&'a str>,
@@ -1588,13 +1562,19 @@ fn estimated_height(message: &Message, width: f32, new_day: bool) -> f32 {
     40.0 + body + if new_day { 36.0 } else { 0.0 }
 }
 
+/// Incoming messages carry their sender's picture and name in groups only,
+/// as on WhatsApp.
+fn shows_sender_pictures(chat: &Chat) -> bool {
+    chat.is_group()
+}
+
 fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     let palette = app.palette;
     // Check out the conversation while drawing rows and collecting actions.
     let mut conversation = app.conversations.remove(&chat.id).unwrap_or_default();
     let typing = app.typing_in(&chat.id);
     let mut avatars = HashMap::new();
-    if chat.is_group() || app.settings.show_sender_pictures {
+    if shows_sender_pictures(chat) {
         let mut senders: HashSet<String> = conversation
             .messages
             .iter()
@@ -1620,7 +1600,6 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         connected: app.link.is_connected(),
         poll_voting: &app.poll_voting,
         interactive_pending: &app.interactive_sending,
-        pictures: app.settings.show_sender_pictures,
         anchor: if conversation.loading_older || conversation.fetching_phone {
             None
         } else {
@@ -1669,7 +1648,6 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         .map(|(_, ids)| ids.clone());
     let scroll_to_bottom =
         app.scroll_to_bottom && divider.as_ref().is_none_or(|(.., placed)| *placed);
-    let app_pictures = app.settings.show_sender_pictures;
     // The message a quote or search result jumped to flashes once in view.
     let jump = app
         .jump_highlight
@@ -1835,7 +1813,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             }
                             ui.add_space(4.0);
                         }
-                        let show_sender = (chat.is_group() || app_pictures)
+                        let show_sender = shows_sender_pictures(chat)
                             && !message.from_me
                             && (new_day
                                 || previous.is_none_or(|previous| {
@@ -2113,7 +2091,7 @@ fn top_of_history(
 fn typing_bubble(ui: &mut egui::Ui, view: &View<'_>, typers: &[(String, String)]) {
     let palette = view.palette;
     ui.horizontal(|ui| {
-        if view.chat.is_group() || view.pictures {
+        if shows_sender_pictures(view.chat) {
             let count = typers.len().min(3);
             let step = SENDER_AVATAR * 0.6;
             let width = SENDER_AVATAR + step * (count.saturating_sub(1)) as f32;
@@ -2376,7 +2354,7 @@ fn bubble(
         palette: view.palette.on_bubble(own),
         ..*view
     };
-    let with_avatar = !own && (view.chat.is_group() || view.pictures);
+    let with_avatar = !own && shows_sender_pictures(view.chat);
     let carousel = matches!(&message.content, Content::Interactive { card: Some(card), .. } if !card.carousel.is_empty());
     let max_width = ((ui.available_width() * if carousel { 0.95 } else { 0.72 })
         .min(if carousel { 920.0 } else { 560.0 })
@@ -4063,6 +4041,7 @@ fn content(
                                         phone: account.clone(),
                                         first,
                                         last,
+                                        to_phone: None,
                                     });
                                 }
                             });
@@ -6321,6 +6300,16 @@ fn chat_of(chat: &ChatId) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_pictures_show_in_groups_only() {
+        let chat = |id: &str| Chat::new(id.into(), "Chat".into());
+        assert!(shows_sender_pictures(&chat("120363012345678901@g.us")));
+        assert!(!shows_sender_pictures(&chat("393331234567@s.whatsapp.net")));
+        assert!(!shows_sender_pictures(&chat(
+            "120363055566677788@newsletter"
+        )));
+    }
 
     fn contact(name: &str, number: &str, account: Option<&str>) -> Option<SharedContact> {
         Some(SharedContact {

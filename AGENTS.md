@@ -172,13 +172,17 @@ protocol. These notes are for coding agents and new contributors.
   history request for such a chat is anchored at the present with an
   empty message id (`worker::fetch_older`), and the app asks the phone
   as soon as such a chat loads or opens, instead of never.
-- `src/vsync.rs` decides vsync once per run. A Wayland compositor stops
-  sending frame callbacks to a hidden window, and a vsync wait there blocks
-  the event loop and its ping replies, so Hyprland calls the app
-  unresponsive. Vsync is on only where that cannot happen: off Wayland, or
-  when the compositor reports hidden windows as suspended (xdg_wm_base v6),
-  which the winit fork turns into `Occluded` so eframe stops painting them.
-  Repaints are event-driven, so nothing spins.
+- A Wayland compositor may stop sending frame callbacks to a window it isn't
+  showing without saying so (Hyprland does for a window covered by a
+  fullscreen or maximized one, #190), and a vsync swap there blocks the event
+  loop and its ping replies, so the compositor calls the app unresponsive.
+  The shared egui fork (crmne/egui apps-0.36, emilk/egui#8631) presents
+  without a blocking swap on Wayland, paces frames by frame callbacks, and
+  runs only `App::logic` when a redraw is 250 ms overdue; the winit fork
+  (apps-0.30, rust-windowing/winit#4709) reports `suspended` as `Occluded`.
+  Vsync stays on elsewhere. Spotifast, RekordFlash and TonePush pin the same
+  two revisions; move them together. Repaints are event-driven, so nothing
+  spins.
 - `src/voice.rs` is the codec for voice messages: OGG/Opus in and out
   (the `ogg` crate for the container, `opus` with libopus bundled and
   built by cmake for the codec, so cmake is a build dependency), plus
@@ -222,8 +226,9 @@ protocol. These notes are for coding agents and new contributors.
   when a new window is made. `src/tray.rs` is the Linux status notifier
   (ksni), `src/tray_native.rs` the Windows and macOS item (tray-icon; on
   macOS made with the first window and pumped by `tray::idle` while none
-  exists). `src/single_instance.rs` holds a loopback port so a second
-  launch surfaces the first. `src/notify.rs` sends desktop notifications
+  exists). `src/single_instance.rs` holds a lock file in the runtime
+  directory, and a second launch asks the first to surface over a private
+  socket (a token-checked loopback port on Windows). `src/notify.rs` sends desktop notifications
   for `Event::Incoming` (live messages from others, not history) when the
   reader is away from that chat; a click carries the chat and the message
   id, so the reader lands on the announced message. macOS has no title bar:

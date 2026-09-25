@@ -170,14 +170,19 @@ pub fn paint_selectable(
     // original screen position; layout, hit targets, and link offsets stay put.
     let mut galley = (*text.galley).clone();
     let column = ui.clip_rect().x_range();
-    let offset = pos.x - column.min;
+    // Both ends on whole physical pixels: egui rounds where it paints the
+    // galley, not this shift, so a fractional offset left every glyph of a
+    // bubble between pixels and blurred it (0.21 px at 133%).
+    let ppp = ui.pixels_per_point();
+    let pos = Pos2::new(snap(pos.x, ppp), pos.y);
+    let offset = pos.x - snap(column.min, ppp);
     for row in &mut galley.rows {
         row.pos.x += offset;
     }
     galley.rect.min.x = 0.0;
     galley.rect.max.x = column.span();
     galley.mesh_bounds = galley.mesh_bounds.translate(egui::vec2(offset, 0.0));
-    let selection_pos = Pos2::new(column.min, pos.y);
+    let selection_pos = Pos2::new(snap(column.min, ppp), pos.y);
     egui::text_selection::LabelSelectionState::label_text_selection(
         ui,
         response,
@@ -189,6 +194,11 @@ pub fn paint_selectable(
     if visible {
         emoji::paint(ui, &text.galley, pos, &text.placements);
     }
+}
+
+/// Rounds a coordinate in points to the nearest physical pixel.
+fn snap(points: f32, pixels_per_point: f32) -> f32 {
+    (points * pixels_per_point).round() / pixels_per_point
 }
 
 /// Plain text with resolved mentions, used in previews.
@@ -656,6 +666,17 @@ const KNOWN_TLDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapped_offsets_land_on_whole_pixels() {
+        for ppp in [1.0, 4.0 / 3.0, 1.6, 2.0] {
+            for x in [0.0, 13.37, 101.9, 642.21] {
+                let pixels = snap(x, ppp) * ppp;
+                assert!((pixels - pixels.round()).abs() < 1e-3, "{x} at {ppp}");
+                assert!((snap(x, ppp) - x).abs() <= 0.5 / ppp + 1e-4);
+            }
+        }
+    }
 
     fn kinds(text: &str) -> Vec<(String, bool, bool, bool, bool)> {
         parse(text, &[])

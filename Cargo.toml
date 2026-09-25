@@ -1,6 +1,6 @@
 [package]
 name = "zapfast"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -127,27 +127,31 @@ tr = { version = "0.1.11", default-features = false }
 sys-locale = "0.3"
 
 [patch.crates-io]
-# Right-to-left shaping and glyph clusters from crmne/zapfast#144, and digits
-# shaped left to right in text without right-to-left letters (#184), on top of
-# egui 0.36.1. Every egui crate comes from the same revision so they share one
-# emath and epaint. Drop this once egui releases bidirectional text support.
-ecolor = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-eframe = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-egui = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-egui-wgpu = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-egui-winit = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-egui_extras = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-egui_glow = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-emath = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-epaint = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-epaint_default_fonts = { git = "https://github.com/crmne/egui", rev = "8e5923482f6882a169b5c74ee6b380089f890391" }
-# winit 0.30.13 plus Wayland `Occluded` events for the xdg-shell suspended
-# state, so a hidden window stops painting instead of blocking on vsync.
-# Shared with Spotifast and proposed upstream as rust-windowing/winit#4709.
-# Also file drag and drop on Wayland through the data device (#178), which
-# upstream only has in 0.31's new drag-and-drop API (winit#4571). Drop the
-# fork when ZapFast moves to a winit release with both.
-winit = { git = "https://github.com/crmne/winit", rev = "05fbaf7a757b7657f717c07761d8ff4db81fa426" }
+# crmne/egui apps-0.36, shared with Spotifast, RekordFlash and TonePush: egui
+# 0.36.1 with right-to-left shaping and glyph clusters from crmne/zapfast#144
+# and digits shaped left to right in text without right-to-left letters (#184)
+# (emilk/egui#8577), egui's busy-loop fix (emilk/egui#8398), and eframe pacing
+# Wayland frames by the compositor's frame callbacks so a window the
+# compositor stops showing never blocks in a vsync swap (emilk/egui#8631).
+# Every egui crate comes from the same revision so they share one emath and
+# epaint. Drop this once egui releases all three.
+ecolor = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+eframe = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+egui = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+egui-wgpu = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+egui-winit = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+egui_extras = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+egui_glow = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+emath = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+epaint = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+epaint_default_fonts = { git = "https://github.com/crmne/egui", rev = "0b431145c22ee27b20b0aff7243d74f4b32e9a79" }
+# crmne/winit apps-0.30, shared with the same apps: winit 0.30.13 plus Wayland
+# `Occluded` for the xdg-shell suspended state with commits on the app's behalf
+# while it isn't presenting (rust-windowing/winit#4709, #4710), macOS Quit
+# through close requests (winit#4692), and file drag and drop on Wayland
+# through the data device (#178), which upstream only has in 0.31's new API
+# (winit#4571). eframe from the fork above calls the Occluded API.
+winit = { git = "https://github.com/crmne/winit", rev = "fc4f39ff0993dd235952b749dd16b856c0194e1f" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 notify = "8.2"
@@ -160,9 +164,6 @@ ksni = { version = "0.3", features = ["blocking"] }
 zbus = { version = "5.19", default-features = false, features = ["blocking-api", "tokio"] }
 # Reads the time locale's clock format.
 libc = "0.2"
-# Asks the Wayland compositor whether it reports hidden windows as suspended
-# (xdg-shell v6), which decides whether vsync is safe. Already in winit's tree.
-wayland-client = "0.31"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # Windows and macOS tray item.
@@ -174,7 +175,7 @@ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 # stay on the main thread.
 objc2 = "0.6"
 raw-window-handle = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSButton", "NSControl", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSText", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSButton", "NSControl", "NSEvent", "NSGraphicsContext", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSText", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSDateFormatter", "NSFormatter", "NSGeometry", "NSLocale", "NSObjCRuntime", "NSRunLoop", "NSString"] }
 
 [target.'cfg(windows)'.dependencies]
