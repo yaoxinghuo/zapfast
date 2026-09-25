@@ -50,7 +50,7 @@ jobs:
           bash packaging/macos/bundle.sh universal/zapfast dist/dmg-input/ZapFast.app "$version"
           cp README.md LICENSE THIRD-PARTY-NOTICES.md dist/dmg-input/
 
-      - uses: ruby/setup-ruby@v1
+      # dmg.rb only needs Ruby's stdlib; the runner's system Ruby is enough.
       - name: DMG
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
