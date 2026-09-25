@@ -23,9 +23,9 @@ On Arch Linux and derivatives, install from the
 [AUR](https://aur.archlinux.org/packages/{{ name }}-bin):
 
 ```sh
-paru -S {{ name }}-bin   # prebuilt
-paru -S {{ name }}       # builds from the release source
-paru -S {{ name }}-git   # builds from the latest commit
+yay -S {{ name }}-bin    # prebuilt
+yay -S {{ name }}        # builds from the release source
+yay -S {{ name }}-git    # builds from the latest commit
 ```
 
 For other distributions, download a tarball with the binary, desktop file,
@@ -47,6 +47,12 @@ One download for both Apple Silicon and Intel:
 - [{{ name }}-v{{ v }}-macos-universal.dmg]({{ base }}/{{ name }}-v{{ v }}-macos-universal.dmg)
 
 Open it and drag **{{ app }}** to Applications.
+
+If you use [Homebrew](https://brew.sh), you can install it with:
+
+```sh
+brew install --cask crmne/tap/zapfast
+```
 
 The app is signed with Developer ID and notarized by Apple. The DMG includes
 a validated notarization ticket.
