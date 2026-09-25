@@ -23,6 +23,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      # The repository pins its toolchain; add the cross-target's standard
+      # library to the toolchain the pin actually resolves to.
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-universal-personal
