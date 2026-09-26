@@ -18,13 +18,17 @@ mod windows;
 pub use badge::Badge;
 #[cfg(target_os = "windows")]
 pub use badge_windows::{Badge, Taskbar};
+#[cfg(target_os = "macos")]
+mod badge_macos;
+#[cfg(target_os = "macos")]
+pub use badge_macos::Badge;
 
 /// A no-op taskbar badge on platforms without a taskbar badge implementation.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 #[derive(Default)]
 pub struct Badge;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 impl Badge {
     /// Does nothing; no supported desktop here reads a taskbar badge.
     pub fn set(&mut self, _count: u32) {}
