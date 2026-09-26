@@ -203,6 +203,10 @@ windows = { version = "0.62", features = ["Media_Control", "Foundation_Collectio
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+# Compiles the Objective-C @try/@catch behind the Touch Bar guard.
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tempfile = "3"
 # Checks the default log filter the way fastframe-log's logger reads it.

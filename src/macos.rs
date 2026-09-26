@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
 use objc2_app_kit::{NSApplication, NSText};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem as Native, Submenu};
 
@@ -106,12 +107,65 @@ fn build_menu() -> tray_icon::menu::Result<Menu> {
     Ok(menu)
 }
 
+/// Works around an AppKit bug that aborts the process when a window closes on
+/// a Mac with a Touch Bar. The Touch Bar finder observes `nextResponder` on
+/// each responder in the key window's chain and invalidates the observations
+/// from a display-cycle callback. Window teardown can remove a registration
+/// first, so the finder's `removeObserver` throws NSRangeException ("not
+/// registered as an observer"), seen as EXC_BREAKPOINT on close
+/// (emilk/egui#2768). Swallowing that one exception inside `invalidate` makes
+/// the stale removal the no-op it was meant to be; the rest of the original
+/// implementation still runs. The class is private: if Apple renames it the
+/// guard is simply not installed.
+fn guard_touch_bar_finder() {
+    type Invalidate = unsafe extern "C-unwind" fn(*mut AnyObject, Sel);
+    static ORIGINAL: std::sync::OnceLock<Invalidate> = std::sync::OnceLock::new();
+
+    // The @try/@catch is compiled C (build_support/touch_bar_guard.m): an
+    // Objective-C exception has to unwind through every frame up to the
+    // catcher, and Rust frames emit no unwind tables under the release
+    // profile's `panic = "abort"`, so `objc2::exception::catch` aborts the
+    // process before it can see the exception.
+    unsafe extern "C" {
+        /// Returns false when it swallowed the stale-observer NSRangeException.
+        fn zapfast_call_swallowing_range_error(
+            imp: Invalidate,
+            object: *mut AnyObject,
+            selector: Sel,
+        ) -> bool;
+    }
+
+    unsafe extern "C-unwind" fn guarded(this: *mut AnyObject, cmd: Sel) {
+        let Some(original) = ORIGINAL.get() else {
+            return;
+        };
+        if unsafe { !zapfast_call_swallowing_range_error(*original, this, cmd) } {
+            log::warn!("Touch Bar finder hit a stale responder registration; ignored it");
+        }
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let Some(class) = AnyClass::get(c"_NSTouchBarFinderObservation") else {
+            return;
+        };
+        let Some(method) = class.instance_method(objc2::sel!(invalidate)) else {
+            return;
+        };
+        let _ = ORIGINAL.set(std::mem::transmute::<Imp, Invalidate>(
+            method.implementation(),
+        ));
+        method.set_implementation(std::mem::transmute::<Invalidate, Imp>(guarded));
+    });
+}
+
 pub fn attach(ctx: &egui::Context) {
     ctx.add_plugin(MenuInput(Arc::clone(&EDIT_EVENTS)));
     // Layout tests use headless contexts on test threads, without an NSApp.
     if objc2::MainThreadMarker::new().is_none() {
         return;
     }
+    guard_touch_bar_finder();
     *REPAINT.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         // The tray's menu shares muda's one handler; its ids are its own.

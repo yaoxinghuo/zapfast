@@ -1,0 +1,64 @@
+# Personal macOS build: unsigned universal DMG for the fork's own use.
+# Unlike release.yml this needs no Apple credentials and runs on demand or on
+# pushes to the personal branch; grab the DMG from the run's artifacts.
+name: macOS build (personal)
+
+on:
+  push:
+    branches: [personal, personal-v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS universal app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      # The repository pins its toolchain; add the cross-target's standard
+      # library to the toolchain the pin actually resolves to.
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal-personal
+
+      - name: Build both architectures
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+
+      - name: Universal binary
+        run: |
+          mkdir -p universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/zapfast \
+            target/x86_64-apple-darwin/release/zapfast \
+            -output universal/zapfast
+
+      - name: App bundle
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          mkdir -p dist/dmg-input
+          bash packaging/macos/bundle.sh universal/zapfast dist/dmg-input/ZapFast.app "$version"
+          cp README.md LICENSE THIRD-PARTY-NOTICES.md dist/dmg-input/
+
+      # dmg.rb only needs Ruby's stdlib; the runner's system Ruby is enough.
+      - name: DMG
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          ruby packaging/macos/dmg.rb dist/dmg-input \
+            "dist/zapfast-v${version}-personal-${GITHUB_SHA::7}-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-universal-personal
+          path: dist/*.dmg
+          if-no-files-found: error
