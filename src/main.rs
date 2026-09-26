@@ -210,7 +210,16 @@ fn main() -> eframe::Result<()> {
     let mut app = if demo {
         app::App::headless(dirs, settings).0
     } else {
-        app::App::new(&waker, dirs, settings, app::AppOptions { tray: true })
+        app::App::new(
+            &waker,
+            dirs,
+            settings,
+            app::AppOptions {
+                // macOS hides to the Dock instead of a status item; the reopen
+                // handler in crate::macos is what brings the window back.
+                tray: !cfg!(target_os = "macos"),
+            },
+        )
     };
     if cli.verbose {
         app.update_arguments.push("--verbose".into());

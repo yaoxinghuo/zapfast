@@ -872,9 +872,11 @@ impl App {
         self.wants_show = false;
     }
 
-    /// Whether window close keeps the app in the tray.
+    /// Whether window close keeps the app running without it.
     pub fn hides_to_tray(&self) -> bool {
-        self.tray.is_some() && self.settings.keep_running_in_background
+        // macOS needs no status item: a Dock click reopens the window.
+        (self.tray.is_some() || cfg!(target_os = "macos"))
+            && self.settings.keep_running_in_background
     }
 
     fn handle_tray(&mut self) {

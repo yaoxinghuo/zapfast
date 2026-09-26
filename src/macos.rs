@@ -3,9 +3,12 @@
 //! traffic lights are placed by fastframe-macos.
 
 use std::cell::RefCell;
+use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+use objc2::Encode;
+use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, MethodImplementation, Sel};
 use objc2_app_kit::{NSApplication, NSText};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem as Native, Submenu};
 
@@ -18,6 +21,9 @@ static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static EDIT_EVENTS: LazyLock<Arc<Mutex<Vec<egui::Event>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 static REPAINT: Mutex<Option<egui::Context>> = Mutex::new(None);
+/// A Dock click while no window shows, replayed as `Action::ShowWindow` by
+/// `drain` — ZapFast hides to the Dock instead of a status item.
+static REOPEN: AtomicBool = AtomicBool::new(false);
 
 /// Menu edits must reach the input before egui processes focus and selection.
 struct MenuInput(Arc<Mutex<Vec<egui::Event>>>);
@@ -166,6 +172,7 @@ pub fn attach(ctx: &egui::Context) {
         return;
     }
     guard_touch_bar_finder();
+    install_reopen_handler();
     *REPAINT.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         // The tray's menu shares muda's one handler; its ids are its own.
@@ -290,6 +297,67 @@ fn action(id: &str) -> Option<Action> {
     })
 }
 
+/// A Dock click, asking for the app back. `has_visible_windows` is not the
+/// question it sounds like: a window sitting in the Dock counts as visible,
+/// which is exactly the case that needs help, so the flag is not consulted
+/// (Spotifast ec75951). Asking for a window that is already up costs a
+/// focus and nothing else.
+extern "C-unwind" fn application_should_handle_reopen(
+    _delegate: *mut AnyObject,
+    _selector: Sel,
+    _application: *mut NSApplication,
+    _has_visible_windows: Bool,
+) -> Bool {
+    REOPEN.store(true, Ordering::Relaxed);
+    // A minimized window draws no frames; without a wake nobody reads the
+    // flag.
+    if let Some(ctx) = &*REPAINT.lock().unwrap_or_else(|p| p.into_inner()) {
+        ctx.request_repaint();
+    }
+    Bool::YES
+}
+
+/// Adds `applicationShouldHandleReopen:hasVisibleWindows:` to winit's
+/// application delegate, unless it already answers it.
+fn install_reopen_handler() {
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(delegate) = app.delegate() else {
+        log::warn!("the macOS application delegate is unavailable");
+        return;
+    };
+    let delegate: &AnyObject = AsRef::<AnyObject>::as_ref(&*delegate);
+    let class = delegate.class();
+    let selector = objc2::sel!(applicationShouldHandleReopen:hasVisibleWindows:);
+    if class.responds_to(selector) {
+        return;
+    }
+    let implementation: extern "C-unwind" fn(
+        *mut AnyObject,
+        Sel,
+        *mut NSApplication,
+        Bool,
+    ) -> Bool = application_should_handle_reopen;
+    let Ok(types) = CString::new(format!("{}@:@{}", Bool::ENCODING, Bool::ENCODING)) else {
+        return;
+    };
+    // SAFETY: the implementation's signature matches the type encoding, and
+    // the selector is not yet on the class, so nothing is replaced.
+    let installed = unsafe {
+        objc2::ffi::class_addMethod(
+            std::ptr::from_ref::<AnyClass>(class).cast_mut(),
+            selector,
+            implementation.__imp(),
+            types.as_ptr(),
+        )
+    };
+    if !installed.as_bool() {
+        log::warn!("the macOS Dock reopen handler could not be installed");
+    }
+}
+
 pub fn drain(hidden: bool) -> Vec<Action> {
     if hidden {
         EDIT_EVENTS
@@ -299,6 +367,9 @@ pub fn drain(hidden: bool) -> Vec<Action> {
     }
     let events = std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|p| p.into_inner()));
     let mut actions = Vec::new();
+    if REOPEN.swap(false, Ordering::Relaxed) {
+        actions.push(Action::ShowWindow);
+    }
     for id in events {
         if let Some(action) = action(&id) {
             if hidden
