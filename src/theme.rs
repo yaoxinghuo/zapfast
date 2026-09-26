@@ -496,6 +496,7 @@ fastframe_icons::icons! {
         Download => "download",
         Timer => "timer",
         Ellipsis => lucide "ellipsis",
+        Eraser => "eraser",
         ExternalLink => lucide "external-link",
         Eye => lucide "eye",
         EyeOff => lucide "eye-off",

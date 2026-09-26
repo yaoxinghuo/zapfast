@@ -1045,7 +1045,8 @@ impl Worker {
     }
 
     /// Empties a chat while keeping it listed.
-    fn empty_chat(&mut self, chat: &str, through: i64, delete_media: bool) {
+    /// Empties a chat through `through`; false when the archive could not.
+    fn empty_chat(&mut self, chat: &str, through: i64, delete_media: bool) -> bool {
         match self.archive.remove_chat_through(chat, through, false) {
             Ok(removed) => {
                 self.pending_older.remove(chat);
@@ -1059,8 +1060,12 @@ impl Worker {
                     });
                     self.emit_chat(chat);
                 }
+                true
             }
-            Err(_error) => log::warn!("could not clear a chat"),
+            Err(_error) => {
+                log::warn!("could not clear a chat");
+                false
+            }
         }
     }
 
@@ -1436,7 +1441,11 @@ impl Worker {
                         crate::proxy::agent(),
                     ))
             }
-            None => builder,
+            // Every address the host resolves to is dialed, not only the first
+            // one, so a network whose IPv6 does not answer still links over
+            // IPv4 (#212).
+            None => builder
+                .with_transport_factory(crate::transport::HappyEyeballsTransportFactory::new()),
         };
         let bot = builder
             // WhatsApp reads the linked-device name, version, and icon at pairing.
@@ -1660,6 +1669,8 @@ impl Worker {
         self.privacy_ready = true;
         self.load_state();
         self.emit(Event::Syncing(self.syncing));
+        // The picker may have been sent an empty Received shelf meanwhile.
+        self.emit_stickers();
         // Answer the reads made while content was withheld, now that the
         // chat list they belong to has been sent.
         for page in std::mem::take(&mut self.withheld_pages) {
@@ -2344,7 +2355,7 @@ impl Worker {
                         .and_then(|range| range.last_message_timestamp),
                     update.timestamp.timestamp(),
                 );
-                self.empty_chat(&chat, through, update.delete_media);
+                let _ = self.empty_chat(&chat, through, update.delete_media);
             }
             E::MarkChatAsReadUpdate(update) => {
                 let chat = self.canonical(&update.jid);
@@ -3397,12 +3408,16 @@ impl Worker {
             let sender = message.sender.clone();
             self.remember_push_name(&sender, push_name);
         }
-        let is_new = self
-            .archive
-            .message(&chat, &message.id)
-            .ok()
-            .flatten()
-            .is_none();
+        let existing = self.archive.message(&chat, &message.id).ok().flatten();
+        let is_new = existing.is_none();
+        let mut message = message;
+        // A duplicate delivery or a history replay reclassifies the same
+        // message. Carry what the row already knew about its files over, or
+        // the insert below replaces the content with a fresh classification
+        // that has no downloaded path.
+        if let Some(existing) = &existing {
+            message.content.keep_local_paths(&existing.content);
+        }
         if let Err(error) = self.archive.insert_message(&message, raw.as_deref()) {
             log::warn!("could not store a message: {error}");
             return;
@@ -3789,7 +3804,7 @@ impl Worker {
                 let delivered_at = first(|receipt| receipt.receipt_timestamp)
                     .filter(|_| !group && (read || message.status == Delivery::Delivered));
                 let read_at = first(|receipt| receipt.read_timestamp).filter(|_| !group && read);
-                let row = Message {
+                let mut row = Message {
                     id: message.id,
                     chat: id.clone(),
                     sender,
@@ -3824,6 +3839,11 @@ impl Worker {
                         );
                     }
                     poll_history_received = self.history_poll_votes(&row, &message.poll_votes);
+                }
+                // History replays and on-demand chunks can repeat a message the
+                // archive already holds; keep the files it already downloaded.
+                if let Ok(Some(existing)) = self.archive.message(&id, &row.id) {
+                    row.content.keep_local_paths(&existing.content);
                 }
                 if let Err(error) = self.archive.insert_message(&row, Some(&raw)) {
                     log::warn!("could not store a history message: {error}");
@@ -4931,6 +4951,68 @@ impl Worker {
                     ));
                 }
             }
+            Command::ClearChat(chat) => {
+                // The phone clears first, for the same reason it deletes
+                // first: clearing here while offline would leave the messages
+                // on the phone, and the next sync would bring them back
+                // despite the dialog saying they were cleared there too.
+                let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&chat)) else {
+                    self.emit(Event::Error(
+                        "Connect to WhatsApp to clear this chat".to_owned(),
+                    ));
+                    return;
+                };
+                let Some(through) = clear_boundary(self.archive.messages(&chat, None, 1)) else {
+                    // Without the boundary this archive would be cleared through
+                    // a time it never agreed to, and the two sides would drift
+                    // while the dialog said they matched. Nothing is cleared
+                    // anywhere.
+                    log::warn!("could not read the boundary of a chat to clear");
+                    self.emit(Event::Error(
+                        "Could not read this chat's messages. Try again".to_owned(),
+                    ));
+                    return;
+                };
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let cleared = client
+                        .chat_actions()
+                        .clear_chat(
+                            &jid,
+                            true,
+                            true,
+                            Some(whatsapp_rust::message_range(through, None, Vec::new())),
+                        )
+                        .await
+                        .is_ok();
+                    let _ = commands.send(Command::ChatCleared {
+                        chat,
+                        cleared,
+                        through,
+                    });
+                });
+            }
+            Command::ChatCleared {
+                chat,
+                cleared,
+                through,
+            } => {
+                if cleared {
+                    if !self.empty_chat(&chat, through, true) {
+                        // The phone has cleared it; say so rather than leave
+                        // the messages here looking as if nothing happened.
+                        self.emit(Event::Error(
+                            "The phone cleared this chat, but ZapFast could not clear it here"
+                                .to_owned(),
+                        ));
+                    }
+                } else {
+                    log::warn!("the phone did not clear a chat");
+                    self.emit(Event::Error(
+                        "The phone did not clear this chat. Try again when connected".to_owned(),
+                    ));
+                }
+            }
             Command::SetPinned(chat, pinned) => {
                 let _ = self.archive.set_pinned(&chat, pinned);
                 self.emit_chat(&chat);
@@ -5976,7 +6058,9 @@ impl Worker {
             message: id,
             result,
         });
-        if for_picker {
+        // Listing the shelves scans the archive; one pass per batch keeps
+        // a send queued behind many picker downloads from waiting on each.
+        if for_picker && self.sticker_downloads.is_empty() {
             self.emit_stickers();
         }
     }
@@ -8199,6 +8283,17 @@ fn ensure_message_secret(raw: Vec<u8>, secret: Option<&[u8]>) -> Vec<u8> {
     context.message_secret = Some(secret.to_vec());
     message.message_context_info = MessageField::some(context);
     message.encode_to_vec()
+}
+
+/// The newest message the archive holds for a chat: the boundary the phone is
+/// asked to clear through. An archive that cannot be read yields no boundary at
+/// all, because a guessed one would clear the phone past messages this device
+/// never saw, and the dialog would say both sides matched.
+fn clear_boundary(read: crate::archive::Result<Vec<Message>>) -> Option<i64> {
+    read.ok().map(|page| {
+        page.last()
+            .map_or_else(crate::util::now, |message| message.timestamp)
+    })
 }
 
 #[cfg(test)]
@@ -10869,6 +10964,101 @@ mod receipt_tests {
         assert_eq!(receipts[0].read_at, Some(123));
     }
 
+    /// A duplicate delivery or a history replay reclassifies the same message,
+    /// and a fresh classification carries no local path. Replacing the row with
+    /// it dropped the file that is already on the computer, so the bubble went
+    /// back to offering the download.
+    #[tokio::test]
+    async fn a_duplicate_delivery_keeps_the_downloaded_file() {
+        use crate::model::{Media, MediaState};
+        let (mut worker, _events, _inbox, _wa) = receipt_tests::worker();
+        let mut picture = incoming("photo", 100);
+        picture.content = Content::Image {
+            media: Media {
+                mime: "image/jpeg".into(),
+                size: 10,
+                width: None,
+                height: None,
+                path: None,
+                state: MediaState::Idle,
+            },
+            caption: None,
+        };
+        worker.store_message(picture.clone(), None, None);
+        let chat = PEER.to_owned();
+        let downloaded = std::path::PathBuf::from("/tmp/zapfast-photo.jpg");
+        worker
+            .archive
+            .set_media_path(&chat, "photo", &downloaded)
+            .expect("path")
+            .expect("row");
+
+        // The same message arrives again, as history replay or a redelivery.
+        worker.store_message(picture, None, None);
+
+        let stored = worker
+            .archive
+            .message(&chat, "photo")
+            .expect("read")
+            .expect("row");
+        let Some(media) = stored.content.media() else {
+            panic!("the picture is still a picture");
+        };
+        assert_eq!(
+            media.path.as_deref(),
+            Some(downloaded.as_path()),
+            "the file on the computer survives the replay"
+        );
+
+        // And again through history sync, which files messages on its own path.
+        let history = parse_conversation(wa::Conversation {
+            id: PEER.into(),
+            messages: vec![wa::HistorySyncMsg {
+                message: MessageField::some(wa::WebMessageInfo {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("photo".into()),
+                        from_me: Some(false),
+                        ..Default::default()
+                    }),
+                    message: MessageField::some(wa::Message {
+                        image_message: MessageField::some(wa::message::ImageMessage {
+                            mimetype: Some("image/jpeg".into()),
+                            file_length: Some(10),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    message_timestamp: Some(100),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        worker.apply_history(
+            ParsedHistory {
+                chats: vec![history],
+                push_names: Vec::new(),
+                lids: Vec::new(),
+                stickers: Vec::new(),
+            },
+            false,
+        );
+        let stored = worker
+            .archive
+            .message(&chat, "photo")
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            stored
+                .content
+                .media()
+                .and_then(|media| media.path.as_deref()),
+            Some(downloaded.as_path()),
+            "the file on the computer survives history sync"
+        );
+    }
+
     fn incoming(id: &str, timestamp: i64) -> Message {
         Message {
             from_me: false,
@@ -11956,7 +12146,7 @@ mod chat_removal_tests {
         let (mut worker, _events, _, _) = receipt_tests::worker();
         worker.apply_history(history(CHAT, &[100, 200]), true);
 
-        worker.empty_chat(CHAT, 200, false);
+        assert!(worker.empty_chat(CHAT, 200, false));
         worker.apply_history(history(CHAT, &[150]), false);
         assert!(worker.archive.chat(CHAT).expect("chat").is_some());
         assert!(stored(&worker, CHAT).is_empty());
@@ -12045,6 +12235,68 @@ mod chat_removal_tests {
             events
                 .try_iter()
                 .any(|event| matches!(event, Event::ChatRemoved { chat } if chat == CHAT))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_is_cleared_here_only_after_the_phone_cleared_it() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+
+        // Without a phone connection nothing is cleared anywhere.
+        worker.handle_command(Command::ClearChat(CHAT.into())).await;
+        assert_eq!(stored(&worker, CHAT), ["m100", "m200"]);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+
+        worker
+            .handle_command(Command::ChatCleared {
+                chat: CHAT.into(),
+                cleared: false,
+                through: 200,
+            })
+            .await;
+        assert_eq!(stored(&worker, CHAT), ["m100", "m200"]);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+
+        worker
+            .handle_command(Command::ChatCleared {
+                chat: CHAT.into(),
+                cleared: true,
+                through: 200,
+            })
+            .await;
+        // The chat stays listed; only its messages go.
+        assert!(worker.archive.chat(CHAT).expect("chat").is_some());
+        assert!(stored(&worker, CHAT).is_empty());
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::ChatCleared { chat, .. } if chat == CHAT))
+        );
+    }
+
+    /// A boundary that cannot be read is not `now`: clearing the phone through
+    /// a guessed time would leave the two sides apart while the dialog said
+    /// they matched. An archive with no messages still has one.
+    #[test]
+    fn a_boundary_that_cannot_be_read_is_not_guessed() {
+        assert_eq!(
+            clear_boundary(Err(rusqlite::Error::QueryReturnedNoRows)),
+            None,
+            "no boundary means nothing is cleared anywhere"
+        );
+        let empty: Vec<Message> = Vec::new();
+        assert!(
+            clear_boundary(Ok(empty)).is_some(),
+            "an empty archive clears through now"
         );
     }
 }

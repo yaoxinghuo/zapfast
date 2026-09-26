@@ -890,6 +890,8 @@ pub enum StickerShelf {
     #[default]
     Recent,
     Favorites,
+    /// Stickers others sent us, newest first.
+    Received,
     /// One pack, by its folder.
     Pack(PathBuf),
     /// Importing packs, starting one, or making a sticker.
@@ -1011,8 +1013,18 @@ pub enum Dialog {
     Labels,
     /// Confirms deleting a chat, which cannot be undone.
     ConfirmDeleteChat(ChatId),
+    /// Confirms clearing a chat's messages, which cannot be undone.
+    ConfirmClearChat(ChatId),
     /// Leaves a group or channel, optionally archiving the chat.
     ConfirmLeaveGroup(ChatId),
+    /// Confirms deleting one message. The archive is the only copy, so a
+    /// local delete cannot be undone either.
+    ConfirmDeleteMessage {
+        chat: ChatId,
+        message: String,
+        /// Revokes for everyone instead of deleting only this copy.
+        for_everyone: bool,
+    },
     /// Chooses a destination for an archived message.
     Forward {
         chat: ChatId,
@@ -1155,10 +1167,26 @@ pub struct Toast {
     pub created: Instant,
 }
 
+/// A scroll request for the open chat's message list, from the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scroll {
+    /// About one screen toward older messages.
+    PageUp,
+    /// About one screen toward newer messages.
+    PageDown,
+    /// The top of the loaded history.
+    Top,
+    /// The newest message, eased. `Action::ScrollToBottom` (Ctrl+End) jumps
+    /// there at once.
+    Bottom,
+}
+
 /// Actions queued by views and applied after drawing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Open(Page),
+    /// Opens settings, or closes them when they are already showing.
+    ToggleSettings,
     OpenChat(ChatId),
     /// Creates and opens a chat for a contact without one.
     StartChat {
@@ -1260,6 +1288,8 @@ pub enum Action {
     /// Open externally button inside the preview.
     PreviewImage(PathBuf),
     ZoomImageIn,
+    /// Scales the previewed image by a factor, as the wheel or a pinch asks.
+    ZoomImageBy(f32),
     /// Shows the previewed image at its original size.
     ImageActualSize,
     ZoomImageOut,
@@ -1410,6 +1440,8 @@ pub enum Action {
     },
     /// Deletes a chat here and on the phone.
     DeleteChat(ChatId),
+    /// Clears a chat's messages here and on the phone, keeping the chat.
+    ClearChat(ChatId),
     SetPinned(ChatId, bool),
     /// Marks a chat as a favorite, or removes the mark, here and on the phone.
     SetFavorite(ChatId, bool),
@@ -1462,6 +1494,8 @@ pub enum Action {
     CloseLockedFolder,
     SetChatLockCode(Option<String>),
     ScrollToBottom,
+    /// Scrolls the open chat by about a page, or to the top of its history.
+    ScrollPage(Scroll),
     /// Scrolls the open chat to a message.
     ScrollTo(String),
     /// Updates chat-list search text.

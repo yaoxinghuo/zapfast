@@ -13,8 +13,8 @@ use crate::i18n::Locale;
 use crate::image_preview::PreviewState;
 use crate::model::{
     Action, Chat, ChatFilter, ChatId, Contact, Content, Delivery, Dialog, Gif, GifError, Label,
-    Media, MediaState, Message, Page, PickerTab, SidebarDisplayMode, StickerPack, StickerShelf,
-    Toast, ToastKind,
+    Media, MediaState, Message, Page, PickerTab, Scroll, SidebarDisplayMode, StickerPack,
+    StickerShelf, Toast, ToastKind,
 };
 use crate::paths::AppDirs;
 use crate::settings::{NotificationSound, Settings, ThemeChoice};
@@ -78,6 +78,54 @@ pub struct Conversation {
     /// The height each row last took, keyed by message id, so the transcript
     /// can skip rows far from the viewport instead of laying them out.
     pub(crate) rows: HashMap<String, RowHeight>,
+    /// The keyboard page, Home, or End scroll under way in the message list.
+    pub(crate) key_scroll: Option<KeyScroll>,
+}
+
+/// A keyboard scroll the message list eases through, one instant step per
+/// frame.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyScroll {
+    pub kind: Scroll,
+    /// For PgUp/PgDn, the signed `scroll_with_delta` distance still to cover.
+    pub remaining: f32,
+    /// `ui.input().time` when it started.
+    start: f64,
+    duration: f32,
+    /// The eased progress already applied, from 0 to 1.
+    progress: f32,
+}
+
+impl KeyScroll {
+    pub fn new(kind: Scroll, remaining: f32, start: f64, duration: f32) -> Self {
+        Self {
+            kind,
+            remaining,
+            start,
+            duration,
+            progress: 0.0,
+        }
+    }
+
+    /// Advances the easing to `now` and returns the share of the distance
+    /// still to cover that this frame moves: all of it once time is up. A
+    /// pass redone in the same frame gets 0.
+    pub fn advance(&mut self, now: f64) -> f32 {
+        let t = ((now - self.start) / f64::from(self.duration)).clamp(0.0, 1.0) as f32;
+        if t >= 1.0 || self.progress >= 1.0 {
+            self.progress = 1.0;
+            return 1.0;
+        }
+        // Ease out: a scroll a held key restarts still moves at once.
+        let eased = egui::emath::easing::cubic_out(t);
+        let fraction = (eased - self.progress) / (1.0 - self.progress);
+        self.progress = eased;
+        fraction
+    }
+
+    pub fn done(&self) -> bool {
+        self.progress >= 1.0
+    }
 }
 
 /// A transcript row's height as last laid out or estimated.
@@ -287,6 +335,9 @@ pub struct App {
     /// Demo/test: keep this chat row's context menu open.
     #[cfg(any(test, feature = "demo"))]
     pub open_chat_menu: Option<ChatId>,
+    /// Demo/test: keep the open chat's header menu open.
+    #[cfg(any(test, feature = "demo"))]
+    pub open_header_menu: Option<ChatId>,
     /// Emoji-grid header to scroll into view.
     pub emoji_jump: Option<&'static str>,
     /// Attachments pending in the composer.
@@ -330,6 +381,8 @@ pub struct App {
     pub gif_pending: bool,
     pub gif_error: Option<GifError>,
     pub stickers: Vec<PathBuf>,
+    /// Downloaded stickers others sent, newest first.
+    pub stickers_received: Vec<PathBuf>,
     /// Favorite stickers, newest first.
     pub stickers_saved: Vec<PathBuf>,
     /// Imported sticker packs, newest first.
@@ -410,6 +463,15 @@ pub struct App {
     pub update_arguments: Vec<String>,
     /// Whether to scroll the conversation to its newest message.
     pub scroll_to_bottom: bool,
+    /// One-shot: an explicit jump (Ctrl+End, or the return-to-bottom button)
+    /// must reach the bottom even while a message bubble retains keyboard
+    /// focus, unlike `scroll_to_bottom` set for other reasons (opening a
+    /// chat, sending a message), which still defers to that focus so it is
+    /// not pulled out from under a keyboard-navigating reader.
+    pub scroll_to_bottom_forced: bool,
+    /// A pending page-relative scroll for the open chat, consumed by its
+    /// message list on the next frame.
+    pub scroll_page: Option<Scroll>,
     /// Whether the conversation was at the bottom last frame.
     pub at_bottom: bool,
     /// Message id to scroll into view.
@@ -754,6 +816,8 @@ impl App {
             open_message_menu: None,
             #[cfg(any(test, feature = "demo"))]
             open_chat_menu: None,
+            #[cfg(any(test, feature = "demo"))]
+            open_header_menu: None,
             emoji_jump: None,
             pending: Vec::new(),
             composer_tools_open: false,
@@ -775,6 +839,7 @@ impl App {
             gif_pending: false,
             gif_error: None,
             stickers: Vec::new(),
+            stickers_received: Vec::new(),
             stickers_saved: Vec::new(),
             sticker_packs: Vec::new(),
             stickers_pending: false,
@@ -827,6 +892,8 @@ impl App {
             update_inspecting: false,
             update_arguments: Vec::new(),
             scroll_to_bottom: true,
+            scroll_to_bottom_forced: false,
+            scroll_page: None,
             at_bottom: true,
             scroll_anchor: None,
             jump_highlight: None,
@@ -1109,10 +1176,16 @@ impl App {
         if matches!(
             &self.dialog,
             Some(
-                Dialog::ChatInfo(chat) | Dialog::CreatePoll(chat) | Dialog::ConfirmDeleteChat(chat)
+                Dialog::ChatInfo(chat)
+                    | Dialog::CreatePoll(chat)
+                    | Dialog::ConfirmDeleteChat(chat)
+                    | Dialog::ConfirmClearChat(chat)
             ) if chat == id
-        ) || matches!(&self.dialog, Some(Dialog::Forward { chat, .. }) if chat == id)
-        {
+        ) || matches!(
+            &self.dialog,
+            Some(Dialog::Forward { chat, .. } | Dialog::ConfirmDeleteMessage { chat, .. })
+                if chat == id
+        ) {
             self.dialog = None;
             self.poll_creating = false;
         }
@@ -1954,11 +2027,13 @@ impl App {
                     favorites,
                     packs,
                     recent,
+                    received,
                     emojis,
                 } => {
                     self.stickers_saved = favorites;
                     self.sticker_packs = packs;
                     self.stickers = recent;
+                    self.stickers_received = received;
                     self.sticker_emojis = emojis;
                     // Show a pack made here as soon as it exists. Packs list
                     // newest first, so the first match is the new one.
@@ -2321,6 +2396,11 @@ impl App {
     /// one of its messages would otherwise refer to rows that are gone, and a
     /// pending edit would send `EditText` for a message that no longer exists.
     fn handle_chat_cleared(&mut self, id: &str, through: i64) {
+        // A confirmation that is open for this chat is about messages that are
+        // already gone: clearing again would take what arrived since.
+        if matches!(&self.dialog, Some(Dialog::ConfirmClearChat(chat)) if chat == id) {
+            self.dialog = None;
+        }
         self.notifications.clear(id);
         // Clearing a chat also removes its stored draft.
         self.drafts.remove(id);
@@ -2767,6 +2847,11 @@ impl App {
             // A run of voice messages belongs to the chat it started in.
             self.voice_chat = None;
             self.voice_wanted = None;
+            // A page request belongs to the chat it was pressed in.
+            self.scroll_page = None;
+            if let Some(conversation) = self.conversations.get_mut(&id) {
+                conversation.key_scroll = None;
+            }
         }
         self.emoji_start = None;
         self.mention_start = None;
@@ -3210,6 +3295,16 @@ impl App {
                     self.refocus_composer(ctx);
                 }
             }
+            Action::ToggleSettings => {
+                // The button that opened settings closes them again, and
+                // closing lands on what was showing, exactly as Escape does.
+                let page = if self.page == Page::Settings {
+                    Page::Chats
+                } else {
+                    Page::Settings
+                };
+                self.apply(Action::Open(page), ctx);
+            }
             Action::OpenChat(id) => self.open_chat(id),
             Action::StartChat { id, name } => {
                 if self.chat(&id).is_none() {
@@ -3406,6 +3501,11 @@ impl App {
                     });
                 } else {
                     self.actions.push(Action::OpenFile(path));
+                }
+            }
+            Action::ZoomImageBy(factor) => {
+                if let Some(preview) = &mut self.image_preview {
+                    preview.zoom_by(factor);
                 }
             }
             Action::ZoomImageIn => {
@@ -4040,6 +4140,9 @@ impl App {
             // The chat leaves the list once the phone confirmed, through
             // `Event::ChatRemoved`.
             Action::DeleteChat(chat) => self.backend.send(Command::DeleteChat(chat)),
+            // The messages go once the phone confirmed, through
+            // `Event::ChatCleared`; the chat stays either way.
+            Action::ClearChat(chat) => self.backend.send(Command::ClearChat(chat)),
             Action::SetPinned(chat, pinned) => {
                 if pinned && self.pinned_count() >= self.pin_limit {
                     self.toast(format!("You can only pin {} chats", self.pin_limit));
@@ -4264,7 +4367,21 @@ impl App {
                 self.focus_search = false;
                 self.focus_composer = true;
             }
-            Action::ScrollToBottom => self.scroll_to_bottom = true,
+            Action::ScrollToBottom => {
+                self.scroll_to_bottom = true;
+                // Ctrl+End and the return-to-bottom button are explicit: they
+                // must win over a message bubble's retained keyboard focus.
+                self.scroll_to_bottom_forced = true;
+            }
+            Action::ScrollPage(scroll) => {
+                // Reaching the top releases stick-to-bottom, as the wheel and
+                // the edge-scroll drag do; reaching the bottom (paging down or
+                // End) lets it take over again, so it is left alone here.
+                if matches!(scroll, Scroll::PageUp | Scroll::Top) {
+                    self.scroll_to_bottom = false;
+                }
+                self.scroll_page = Some(scroll);
+            }
             Action::ScrollTo(id) => {
                 self.scroll_to_bottom = false;
                 let Some(chat) = self.open_chat.clone() else {
@@ -4641,6 +4758,13 @@ impl App {
         if let Some(badge) = &mut self.badge {
             badge.set(count);
         }
+    }
+
+    /// The unread total for the Windows taskbar overlay, which the window
+    /// applies itself; `None` in demo and test runs.
+    #[cfg(target_os = "windows")]
+    pub fn taskbar_badge_count(&self) -> Option<u32> {
+        self.badge.as_ref()?.count()
     }
 
     /// Pauses other apps' music while recording or playing audio, as the
@@ -5164,6 +5288,12 @@ impl App {
         });
     }
 
+    /// Whether the latest wheel input came in points (a trackpad), which the
+    /// image preview pans with instead of zooming.
+    pub fn scroll_from_trackpad(&self) -> bool {
+        self.scroll_from_trackpad
+    }
+
     pub fn save_state(&mut self) {
         if self.settings_dirty {
             self.save_settings();
@@ -5374,11 +5504,50 @@ mod tests {
         App::headless(AppDirs::under(&root), Settings::default()).0
     }
 
+    /// A chat that is gone or emptied takes its confirmation with it: a modal
+    /// left behind for a chat that no longer exists still dispatches its
+    /// action, and after a remote clear that action would take what arrived
+    /// since.
+    #[test]
+    fn a_remote_removal_or_clear_closes_the_confirmation() {
+        let mut app = app();
+        let (backend, events) = Backend::detached();
+        app.backend = backend;
+        let chat = "peer@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+
+        app.dialog = Some(Dialog::ConfirmClearChat(chat.into()));
+        events
+            .send(Event::ChatCleared {
+                chat: chat.into(),
+                through: 100,
+            })
+            .unwrap();
+        app.handle_events();
+        assert!(
+            app.dialog.is_none(),
+            "a cleared chat closes its confirmation"
+        );
+
+        app.dialog = Some(Dialog::ConfirmClearChat(chat.into()));
+        events
+            .send(Event::ChatRemoved { chat: chat.into() })
+            .unwrap();
+        app.handle_events();
+        assert!(
+            app.dialog.is_none(),
+            "a removed chat closes its confirmation"
+        );
+    }
+
     /// Demo and test runs share the machine with a linked ZapFast, whose real
     /// taskbar badge they must not overwrite.
     #[test]
     fn demo_and_test_runs_do_not_publish_a_taskbar_badge() {
-        assert!(app().badge.is_none());
+        let app = app();
+        assert!(app.badge.is_none());
+        #[cfg(target_os = "windows")]
+        assert!(app.taskbar_badge_count().is_none());
     }
 
     #[test]
@@ -5473,6 +5642,7 @@ mod tests {
             favorites: Vec::new(),
             packs,
             recent: Vec::new(),
+            received: Vec::new(),
             emojis: std::collections::HashMap::new(),
         }
     }
@@ -6869,6 +7039,94 @@ mod tests {
         assert!(app.dialog.is_none());
         // Neighbouring chats and their search hits stay.
         assert!(app.chat(other).is_some());
+        assert_eq!(app.search_hits.len(), 1);
+    }
+
+    /// A pending delete-message question belongs to one chat. When that chat
+    /// goes away the message is gone with it, so the question must not stay
+    /// open over another chat.
+    #[test]
+    fn a_removed_chat_closes_its_pending_message_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, events) =
+            App::headless(AppDirs::under(directory.path()), Settings::default());
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        for id in [chat, other] {
+            app.chats.push(Chat::new(id.into(), "Peer".into()));
+        }
+        app.dialog = Some(Dialog::ConfirmDeleteMessage {
+            chat: other.into(),
+            message: "m1".into(),
+            for_everyone: true,
+        });
+
+        events
+            .send(Event::ChatRemoved { chat: chat.into() })
+            .unwrap();
+        app.handle_events();
+        // Another chat's question stays open.
+        assert!(app.dialog.is_some());
+
+        events
+            .send(Event::ChatRemoved { chat: other.into() })
+            .unwrap();
+        app.handle_events();
+        assert_eq!(app.dialog, None);
+    }
+
+    #[test]
+    fn a_cleared_chat_keeps_its_row_until_the_phone_confirmed_it() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "peer@s.whatsapp.net";
+        let other = "friend@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.conversations
+            .entry(chat.into())
+            .or_default()
+            .merge(vec![message(chat, "m1", 100)], false);
+        app.drafts.insert(chat.into(), "half-written".into());
+        app.open_chat = Some(chat.into());
+        app.search_hits.push(message(chat, "m1", 100));
+        app.search_hits.push(message(other, "m2", 100));
+
+        let ctx = egui::Context::default();
+        app.apply(Action::ClearChat(chat.into()), &ctx);
+
+        // Nothing changes here until the phone has cleared the chat too.
+        assert!(app.chat(chat).is_some());
+        assert_eq!(
+            app.conversations.get(chat).map(|open| open.messages.len()),
+            Some(1)
+        );
+        assert!(app.drafts.contains_key(chat));
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::ClearChat(id) if id == chat))
+        );
+
+        let (backend, events) = Backend::detached();
+        app.backend = backend;
+        events
+            .send(Event::ChatCleared {
+                chat: chat.into(),
+                through: 100,
+            })
+            .unwrap();
+        app.handle_events();
+
+        // The chat stays open with nothing left in it, and its draft goes.
+        assert!(app.chat(chat).is_some());
+        assert_eq!(
+            app.conversations.get(chat).map(|open| open.messages.len()),
+            Some(0)
+        );
+        assert!(!app.drafts.contains_key(chat));
+        assert_eq!(app.open_chat, Some(chat.into()));
+        // Only the cleared chat loses its search hits.
+        assert!(app.search_hits.iter().all(|hit| hit.chat != chat));
         assert_eq!(app.search_hits.len(), 1);
     }
 

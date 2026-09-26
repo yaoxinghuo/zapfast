@@ -518,6 +518,15 @@ pub enum Command {
         deleted: bool,
         through: i64,
     },
+    /// Clears a chat's messages on the phone, then here once the phone
+    /// agreed. The chat itself stays.
+    ClearChat(ChatId),
+    /// Whether the phone cleared a chat requested through `ClearChat`.
+    ChatCleared {
+        chat: ChatId,
+        cleared: bool,
+        through: i64,
+    },
     SetPinned(ChatId, bool),
     /// Marks a chat as a favorite, or removes the mark, here and on the phone.
     SetFavorite(ChatId, bool),
@@ -775,12 +784,13 @@ pub enum Event {
     /// A shared sticker pack, ready to view, with its publisher; or why it
     /// could not be opened.
     StickerPackPreview(Result<(StickerPack, String), String>),
-    /// Favorite stickers, packs, and recent stickers for the picker, with
-    /// the emojis each sticker is tagged with.
+    /// Favorite stickers, packs, recent stickers, and stickers others sent,
+    /// for the picker, with the emojis each sticker is tagged with.
     Stickers {
         favorites: Vec<PathBuf>,
         packs: Vec<StickerPack>,
         recent: Vec<PathBuf>,
+        received: Vec<PathBuf>,
         emojis: std::collections::HashMap<PathBuf, Vec<String>>,
     },
     Media {
