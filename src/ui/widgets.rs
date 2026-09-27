@@ -124,7 +124,6 @@ pub fn selectable_rich_text(
         );
         crate::emoji::paint(ui, &line.galley, rect.min, &line.placements);
     }
-    crate::markup::selection_probe(ui, &response);
     response
 }
 
