@@ -245,18 +245,41 @@ pub(crate) fn selection_probe(ui: &egui::Ui, response: &egui::Response) {
             )
         })
     };
-    // Pointer events are identical for every row: emit them once per frame.
+    let has_sel = ctx
+        .plugin_opt::<egui::text_selection::LabelSelectionState>()
+        .is_some_and(|plugin| plugin.lock().has_selection());
+    // Per-frame section: pointer events, selection flips, drag heartbeats.
     let stream_key = egui::Id::new("zapfast-selection-probe-stream");
     let stream_logged = ctx.data_mut(|d| {
         let last = d.get_temp::<u64>(stream_key);
         d.insert_temp(stream_key, frame);
         last == Some(frame)
     });
-    if !events.is_empty() && !stream_logged {
-        log::info!(
-            "sel-stream t={time:.3} f={frame} events={events:?} down={down} decided={decided} pos={pos:?} focused={focused} {}",
-            snapshot()
-        );
+    if !stream_logged {
+        let sel_key = egui::Id::new("zapfast-selection-probe-has");
+        let prev_sel = ctx.data_mut(|d| {
+            let last = d.get_temp::<bool>(sel_key).unwrap_or(false);
+            d.insert_temp(sel_key, has_sel);
+            last
+        });
+        if has_sel != prev_sel {
+            log::info!(
+                "sel-flip t={time:.3} f={frame} has_selection={has_sel} pos={pos:?} down={down}"
+            );
+        }
+        if !events.is_empty() {
+            log::info!(
+                "sel-stream t={time:.3} f={frame} events={events:?} down={down} decided={decided} pos={pos:?} focused={focused} sel={has_sel} {}",
+                snapshot()
+            );
+        } else if down && frame % 12 == 0 {
+            // Heartbeat while a button is held: shows the selection living or
+            // dying mid-drag even when no event fires this frame.
+            log::info!(
+                "sel-drag t={time:.3} f={frame} pos={pos:?} sel={has_sel} decided={decided} {}",
+                snapshot()
+            );
+        }
     }
     let Some(pos) = pos else { return };
     if !response.rect.contains(pos) {
@@ -278,7 +301,7 @@ pub(crate) fn selection_probe(ui: &egui::Ui, response: &egui::Response) {
         ctx.data_mut(|d| d.insert_temp(idle_key, time));
     }
     log::info!(
-        "sel-row t={time:.3} f={frame} id={:?} rect={:?} hovered={} contains={} down_on={} dragged={} enabled={} layer={:?} layer_at={:?} events={events:?} {}",
+        "sel-row t={time:.3} f={frame} id={:?} rect={:?} hovered={} contains={} down_on={} dragged={} enabled={} sel={has_sel} layer={:?} layer_at={:?} events={events:?} {}",
         response.id,
         response.rect,
         response.hovered(),
