@@ -195,6 +195,101 @@ pub fn paint_selectable(
     if visible {
         emoji::paint(ui, &text.galley, pos, &text.placements);
     }
+    selection_probe(ui, response);
+}
+
+/// Temporary diagnostics for the intermittent "drag-select produces no
+/// highlight" failure seen on macOS. With ZAPFAST_DEBUG_SELECTION set,
+/// pointer-button and PointerGone events are logged to zapfast.log with the
+/// interaction snapshot; rows under the pointer additionally log their
+/// response flags, so a press that fails to seed a selection shows which
+/// widget or layer swallowed the hover.
+pub(crate) fn selection_probe(ui: &egui::Ui, response: &egui::Response) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ZAPFAST_DEBUG_SELECTION").is_some()) {
+        return;
+    }
+    let ctx = ui.ctx();
+    let frame = ctx.cumulative_frame_nr();
+    let (events, time, down, decided, pos, focused) = ctx.input(|i| {
+        (
+            i.events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        egui::Event::PointerButton { .. }
+                            | egui::Event::PointerGone
+                            | egui::Event::WindowFocused(_)
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+            i.time,
+            i.pointer.any_down(),
+            i.pointer.is_decidedly_dragging(),
+            i.pointer.interact_pos().or(i.pointer.latest_pos()),
+            i.focused,
+        )
+    });
+    let snapshot = || {
+        ctx.interaction_snapshot(|s| {
+            format!(
+                "clicked={:?} drag_started={:?} dragged={:?} hovered={:?} contains={:?}",
+                s.clicked,
+                s.drag_started,
+                s.dragged,
+                s.hovered.iter().collect::<Vec<_>>(),
+                s.contains_pointer.iter().collect::<Vec<_>>(),
+            )
+        })
+    };
+    // Pointer events are identical for every row: emit them once per frame.
+    let stream_key = egui::Id::new("zapfast-selection-probe-stream");
+    let stream_logged = ctx.data_mut(|d| {
+        let last = d.get_temp::<u64>(stream_key);
+        d.insert_temp(stream_key, frame);
+        last == Some(frame)
+    });
+    if !events.is_empty() && !stream_logged {
+        log::info!(
+            "sel-stream t={time:.3} f={frame} events={events:?} down={down} decided={decided} pos={pos:?} focused={focused} {}",
+            snapshot()
+        );
+    }
+    let Some(pos) = pos else { return };
+    if !response.rect.contains(pos) {
+        return;
+    }
+    // In the broken state the press already lands here: hover is missing
+    // either because another widget holds drag focus or something covers the
+    // row. The idle case flags the same coverage persisting between presses.
+    let idle_blocked = !response.hovered() && !down;
+    if events.is_empty() && !idle_blocked {
+        return;
+    }
+    if idle_blocked && events.is_empty() {
+        let idle_key = egui::Id::new("zapfast-selection-probe-idle").with(response.id);
+        let last = ctx.data_mut(|d| d.get_temp::<f64>(idle_key).unwrap_or(f64::NEG_INFINITY));
+        if time - last < 1.0 {
+            return;
+        }
+        ctx.data_mut(|d| d.insert_temp(idle_key, time));
+    }
+    log::info!(
+        "sel-row t={time:.3} f={frame} id={:?} rect={:?} hovered={} contains={} down_on={} dragged={} enabled={} layer={:?} layer_at={:?} events={events:?} {}",
+        response.id,
+        response.rect,
+        response.hovered(),
+        response.contains_pointer(),
+        response.is_pointer_button_down_on(),
+        response.dragged(),
+        response.enabled(),
+        ui.layer_id(),
+        ctx.layer_id_at(pos),
+        snapshot()
+    );
 }
 
 /// Plain text with resolved mentions, used in previews.
