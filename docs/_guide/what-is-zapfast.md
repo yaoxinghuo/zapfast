@@ -56,8 +56,6 @@ ZapFast does not currently support:
   interactive messages. Use these in WhatsApp Web or on your phone. Embedded
   videos, documents, and templates without readable text
   also need another client.
-- Colour emoji on Windows: Segoe UI Emoji is not a bitmap font, so emoji
-  stay monochrome there for now.
 
 When reporting [an issue](https://github.com/crmne/zapfast/issues), include
 what happened, what you expected, and when it happened. This helps match the
@@ -77,7 +75,9 @@ ZapFast connects through
 [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust), which grew out
 of the [whatsmeow](https://github.com/tulir/whatsmeow) lineage. WhatsApp
 Web defines the companion-device model. ZapFast is a sibling of
-[Spotifast](https://spotifast.rocks), a native client for Spotify.
+[Spotifast](https://spotifast.rocks), a native client for Spotify. Both are
+built on [fastframe](https://github.com/crmne/fastframe), the shared foundation
+for native Rust apps built with egui.
 
 ZapFast is an independent project, not affiliated with or endorsed by
 WhatsApp LLC or Meta. WhatsApp is a trademark of WhatsApp LLC.

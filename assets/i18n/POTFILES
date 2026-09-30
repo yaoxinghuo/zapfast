@@ -13,3 +13,6 @@ src/ui/pane.rs
 src/privacy.rs
 src/ui/image_preview.rs
 src/notify/badge_windows.rs
+src/ui/lock.rs
+src/notify.rs
+src/settings.rs

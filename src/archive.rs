@@ -128,7 +128,8 @@ const CHAT_COLUMNS: &str =
                     m.from_me, m.sender_name, m.content, m.status, m.sender, c.participants, c.read_only,
                     c.pinned_at, c.ephemeral_expiration, c.locked, c.group_subject_known,
                     c.notification_sound, c.marked_unread,
-                    (SELECT f.position FROM favorites f WHERE f.chat = c.id), c.left";
+                    (SELECT f.position FROM favorites f WHERE f.chat = c.id), c.left,
+                    c.info_locked, c.group_admin";
 
 /// Adds columns introduced after the initial schema when missing.
 const MIGRATIONS: &[(&str, &str, &str)] = &[
@@ -154,6 +155,10 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("chats", "group_subject_known", "INTEGER NOT NULL DEFAULT 0"),
     ("chats", "marked_unread", "INTEGER NOT NULL DEFAULT 0"),
     ("chats", "pending_unread", "INTEGER"),
+    // NULL until the group's metadata says whether only admins edit its info.
+    ("chats", "info_locked", "INTEGER"),
+    ("chats", "group_admin", "INTEGER NOT NULL DEFAULT 0"),
+    ("contacts", "first_name", "TEXT"),
 ];
 const CHAT_JOIN: &str = "FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
@@ -208,6 +213,8 @@ fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
             .get::<_, Option<i64>>(21)?
             .map_or(0, |position| u32::try_from(position).unwrap_or(u32::MAX)),
         left: row.get(22)?,
+        info_locked: row.get(23)?,
+        admin: row.get(24)?,
     })
 }
 
@@ -418,6 +425,26 @@ impl Archive {
                 serde_json::to_string(participants).unwrap_or_else(|_| "[]".into()),
                 read_only
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Records who may edit the group's name and photo, from its metadata:
+    /// whether only admins may, and whether we are one.
+    pub fn set_group_rights(&self, id: &str, info_locked: bool, admin: bool) -> Result<()> {
+        self.connection.execute(
+            "UPDATE chats SET info_locked = ?2, group_admin = ?3 WHERE id = ?1",
+            params![id, info_locked, admin],
+        )?;
+        Ok(())
+    }
+
+    /// Records a lock or unlock of the group's info announced by WhatsApp,
+    /// which leaves our own role as it was.
+    pub fn set_info_locked(&self, id: &str, info_locked: bool) -> Result<()> {
+        self.connection.execute(
+            "UPDATE chats SET info_locked = ?2 WHERE id = ?1",
+            params![id, info_locked],
         )?;
         Ok(())
     }
@@ -1186,6 +1213,16 @@ impl Archive {
         rows.collect()
     }
 
+    /// Photo, video, and audio messages with their raw protobuf.
+    pub fn media_with_raw(&self) -> Result<Vec<(String, String, Vec<u8>)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT chat, id, raw FROM messages WHERE raw IS NOT NULL AND json_valid(content)
+             AND json_extract(content, '$.kind') IN ('image', 'video', 'audio')",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect()
+    }
+
     /// Interactive messages eligible for a derived presentation upgrade.
     /// Deleted and edited rows are left intact; callers preserve local media paths.
     pub fn interactive_placeholders(&self) -> Result<Vec<(String, String, Vec<u8>)>> {
@@ -1586,11 +1623,18 @@ impl Archive {
 
     pub fn upsert_contact(&self, contact: &Contact) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO contacts (id, full_name, push_name) VALUES (?1, ?2, ?3)
+            "INSERT INTO contacts (id, full_name, first_name, push_name) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
+                first_name = CASE WHEN excluded.full_name IS NULL THEN first_name
+                    ELSE excluded.first_name END,
                 full_name = COALESCE(excluded.full_name, full_name),
                 push_name = COALESCE(excluded.push_name, push_name)",
-            params![contact.id, contact.full_name, contact.push_name],
+            params![
+                contact.id,
+                contact.full_name,
+                contact.first_name,
+                contact.push_name
+            ],
         )?;
         Ok(())
     }
@@ -1599,13 +1643,14 @@ impl Archive {
     pub fn contact(&self, id: &str) -> Result<Option<Contact>> {
         self.connection
             .query_row(
-                "SELECT id, full_name, push_name FROM contacts WHERE id = ?1",
+                "SELECT id, full_name, first_name, push_name FROM contacts WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(Contact {
                         id: row.get(0)?,
                         full_name: row.get(1)?,
-                        push_name: row.get(2)?,
+                        first_name: row.get(2)?,
+                        push_name: row.get(3)?,
                     })
                 },
             )
@@ -1615,12 +1660,13 @@ impl Archive {
     pub fn contacts(&self) -> Result<Vec<Contact>> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, full_name, push_name FROM contacts")?;
+            .prepare("SELECT id, full_name, first_name, push_name FROM contacts")?;
         let rows = statement.query_map([], |row| {
             Ok(Contact {
                 id: row.get(0)?,
                 full_name: row.get(1)?,
-                push_name: row.get(2)?,
+                first_name: row.get(2)?,
+                push_name: row.get(3)?,
             })
         })?;
         rows.collect()
@@ -2095,6 +2141,46 @@ pub(crate) mod tests {
             archive.ephemeral_expiration(chat).expect("expiration"),
             Some(0)
         );
+    }
+
+    /// An archive from before group editing learns who may edit a group's
+    /// info: its rows start as unknown, not as open to everyone, and the
+    /// metadata's answer and later lock notices are kept.
+    #[test]
+    fn group_edit_rights_migrate_as_unknown_and_persist() {
+        let connection = Connection::open_in_memory().expect("opens");
+        connection.execute_batch(SCHEMA).expect("the older schema");
+        connection
+            .execute_batch(
+                "INSERT INTO chats (id, name, kind) VALUES ('1-2@g.us', 'Rust', 'group');",
+            )
+            .expect("row");
+        let archive = Archive::prepare(connection).expect("the migration adds the columns");
+        let id = "1-2@g.us";
+        let row = archive.chat(id).unwrap().unwrap();
+        assert_eq!(row.info_locked, None, "unknown until the metadata says");
+        assert!(!row.admin);
+        assert!(!row.can_edit_info());
+
+        archive.set_group_rights(id, true, true).unwrap();
+        let row = archive.chat(id).unwrap().unwrap();
+        assert_eq!(row.info_locked, Some(true));
+        assert!(row.admin);
+        assert!(row.can_edit_info());
+
+        // A lock notice leaves our role alone; a metadata refresh replaces both.
+        archive.set_info_locked(id, false).unwrap();
+        let row = archive.chat(id).unwrap().unwrap();
+        assert_eq!(row.info_locked, Some(false));
+        assert!(row.admin);
+        archive.set_group_rights(id, true, false).unwrap();
+        let row = archive.chat(id).unwrap().unwrap();
+        assert!(!row.can_edit_info(), "demoted in a locked group");
+        // A metadata refresh of members and subject does not touch them.
+        archive
+            .set_group_info(id, Some("Rust"), &["1@s.whatsapp.net".into()], false)
+            .unwrap();
+        assert_eq!(archive.chat(id).unwrap().unwrap().info_locked, Some(true));
     }
 
     #[test]
@@ -2598,6 +2684,7 @@ pub(crate) mod tests {
             .upsert_contact(&Contact {
                 id: id.into(),
                 full_name: None,
+                first_name: None,
                 push_name: Some("~slavic".into()),
             })
             .expect("stores");
@@ -2605,6 +2692,7 @@ pub(crate) mod tests {
             .upsert_contact(&Contact {
                 id: id.into(),
                 full_name: Some("Slavic".into()),
+                first_name: None,
                 push_name: None,
             })
             .expect("renames");
@@ -2616,6 +2704,45 @@ pub(crate) mod tests {
                 .contact("nobody@s.whatsapp.net")
                 .expect("reads")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_first_name_travels_with_its_saved_name() {
+        let archive = Archive::in_memory().expect("opens");
+        let id = "491700000002@s.whatsapp.net";
+        let saved = |full: Option<&str>, first: Option<&str>, push: Option<&str>| Contact {
+            id: id.into(),
+            full_name: full.map(Into::into),
+            first_name: first.map(Into::into),
+            push_name: push.map(Into::into),
+        };
+        let first_name = || {
+            archive
+                .contact(id)
+                .expect("reads")
+                .expect("exists")
+                .first_name
+        };
+        archive
+            .upsert_contact(&saved(Some("My Dih"), Some("My Dih"), None))
+            .expect("stores");
+        assert_eq!(first_name().as_deref(), Some("My Dih"));
+        archive
+            .upsert_contact(&saved(None, None, Some("dih")))
+            .expect("push name");
+        assert_eq!(
+            first_name().as_deref(),
+            Some("My Dih"),
+            "a push name leaves the saved names alone"
+        );
+        archive
+            .upsert_contact(&saved(Some("Dih"), None, None))
+            .expect("renames");
+        assert_eq!(
+            first_name(),
+            None,
+            "a rename without a first name drops the old one"
         );
     }
 

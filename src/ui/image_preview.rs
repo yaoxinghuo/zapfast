@@ -15,7 +15,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         .fill(palette.overlay)
         .stroke(Stroke::new(1.0, palette.outline))
         .corner_radius(CornerRadius::same(theme::RADIUS + 4))
-        .inner_margin(Margin::same(14));
+        .inner_margin(Margin::same(14))
+        .shadow(palette.modal_shadow());
     let viewport = ctx.content_rect().size();
     let response = egui::Modal::new(egui::Id::new("image-preview"))
         .frame(frame)

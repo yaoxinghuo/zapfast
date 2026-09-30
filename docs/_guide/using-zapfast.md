@@ -76,7 +76,9 @@ The sticker is a 512 × 512 WebP under WhatsApp's 100 KB limit.
 
 ## Attachments
 
-Paste a picture, drop files on the window, or select them with the paperclip.
+Paste a picture or copied files, drop files on the window, or select them with
+the paperclip. On Wayland, dropping files does not work yet: copy them in the
+file manager and paste them instead.
 They stay above the composer until you send them, with the typed text as a
 caption. Press Escape or click a file's close button to remove it. Incoming
 non-sticker attachments up to 64 MiB download when they enter view if automatic
@@ -198,11 +200,16 @@ sharing format:
 
 The search bar finds chats by name, number, or latest message; searches all
 messages stored on this computer; and finds contacts without an existing chat.
+Use `↑`/`↓` to select a matching chat and Enter to open it ready for typing.
 Click a message result to jump to it, or a contact to start a chat. Use
 `Alt+↑/↓`, or `Ctrl+Shift+[` and `Ctrl+Shift+]` as in WhatsApp, to switch chats
 without leaving the composer (Command instead of Ctrl on macOS). Within an open
 chat, `PgUp`/`PgDn` scroll by about a page, and `Home`/`End` jump to the top or
 the newest message (when the input is empty).
+
+Sending while reading older messages keeps your place. Use the
+newest-message button or `End` to return to the latest message when you are
+ready.
 
 A shared contact message shows the name from its vCard. When the card names a
 WhatsApp account, **Chat** opens a private conversation with it and, if the

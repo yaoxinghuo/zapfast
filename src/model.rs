@@ -126,6 +126,11 @@ pub struct Chat {
     /// `read_only`, which an announcement group also carries and which a later
     /// metadata refresh rewrites.
     pub left: bool,
+    /// Whether only admins may change the group's name and photo (WhatsApp's
+    /// "Edit group settings"); `None` until the group's metadata has said.
+    pub info_locked: Option<bool>,
+    /// Whether we are an admin of this group, as its metadata last said.
+    pub admin: bool,
     /// Hidden while WhatsApp chat lock is enabled on the phone.
     pub locked: bool,
     /// Disappearing-message duration in seconds, if enabled.
@@ -170,6 +175,8 @@ impl Chat {
             participants: Vec::new(),
             read_only: false,
             left: false,
+            info_locked: None,
+            admin: false,
             locked: false,
             ephemeral_expiration: None,
             labels: Vec::new(),
@@ -214,6 +221,14 @@ impl Chat {
             return false;
         }
         ours.is_empty() || self.participants.is_empty() || self.lists_any(ours)
+    }
+
+    /// Whether we may change the group's name and photo: any member while the
+    /// group's info is open to everyone, only admins once it is locked. Until
+    /// the metadata says which, nothing is offered, and a group we left is
+    /// not ours to edit.
+    pub fn can_edit_info(&self) -> bool {
+        self.is_group() && !self.left && (self.admin || self.info_locked == Some(false))
     }
 
     /// Whether the member list names any of `ours`.
@@ -445,7 +460,37 @@ pub enum Content {
         /// A live location, which WhatsApp shows only on the phone.
         #[serde(default)]
         live_location: bool,
+        /// What a view-once message holds, when it arrived as media this
+        /// device may not open rather than as a bare placeholder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        once: Option<OnceMedia>,
     },
+}
+
+/// The kind of media a view-once message holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnceMedia {
+    Photo,
+    Video,
+    Voice,
+    Audio,
+}
+
+impl OnceMedia {
+    /// The kind of view-once media `content` would be, if it is media that
+    /// can be sent to be viewed once.
+    pub fn of(content: &Content) -> Option<Self> {
+        match content {
+            Content::Image { .. } => Some(Self::Photo),
+            Content::Video { .. } => Some(Self::Video),
+            Content::Audio {
+                voice_note: true, ..
+            } => Some(Self::Voice),
+            Content::Audio { .. } => Some(Self::Audio),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -566,6 +611,9 @@ impl PollDraft {
         if self.multiple { self.options.len() } else { 1 }
     }
 }
+
+/// The longest group name WhatsApp accepts, in characters.
+pub const GROUP_NAME_LIMIT: usize = whatsapp_rust::wacore::iq::groups::GROUP_SUBJECT_MAX_LENGTH;
 
 /// WhatsApp's longest live location share, in seconds.
 pub const LIVE_LOCATION_LIMIT: i64 = 8 * 60 * 60;
@@ -688,6 +736,15 @@ impl Content {
                 live_location: true,
                 ..
             } => "Live location".to_owned(),
+            Self::PhoneOnly {
+                once: Some(kind), ..
+            } => match kind {
+                OnceMedia::Photo => "View once photo",
+                OnceMedia::Video => "View once video",
+                OnceMedia::Voice => "View once voice message",
+                OnceMedia::Audio => "View once audio",
+            }
+            .to_owned(),
             Self::PhoneOnly {
                 view_once: true, ..
             } => "View once message".to_owned(),
@@ -835,6 +892,10 @@ pub struct DecodedImage {
 pub struct Contact {
     pub id: String,
     pub full_name: Option<String>,
+    /// The first name saved with `full_name`, which WhatsApp shows where
+    /// space is short, as in a group's member line. It may hold several
+    /// words; only a contact saved with a separate first name has one.
+    pub first_name: Option<String>,
     pub push_name: Option<String>,
 }
 
@@ -844,6 +905,15 @@ impl Contact {
             .as_deref()
             .filter(|name| !name.is_empty())
             .or(self.push_name.as_deref().filter(|name| !name.is_empty()))
+    }
+
+    /// The saved first name, when the address-book entry has one.
+    pub fn first_name(&self) -> Option<&str> {
+        self.full_name.as_deref().filter(|name| !name.is_empty())?;
+        self.first_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
     }
 
     /// WhatsApp display name: address-book name or `~`-prefixed push name.
@@ -1276,6 +1346,14 @@ pub enum Action {
     },
     /// Mutes or unmutes video playback.
     ToggleVideoSound,
+    /// Shows a downloaded video over the whole window, starting it if it is
+    /// not the one loaded.
+    ExpandVideo {
+        message: String,
+        path: PathBuf,
+    },
+    /// Puts the video covering the window back in its message.
+    CollapseVideo,
     /// Starts, cancels, or sends a voice recording.
     StartRecording,
     CancelRecording,
@@ -1296,6 +1374,9 @@ pub enum Action {
     FitImage,
     CloseImagePreview,
     OpenFile(PathBuf),
+    /// Opens ZapFast's log, or shows it in its folder when no application
+    /// takes it, and says so when neither works.
+    OpenLog(PathBuf),
     OpenFolder(PathBuf),
     /// Saves a copy of a downloaded attachment where the person chooses.
     SaveAttachmentAs {
@@ -1322,15 +1403,30 @@ pub enum Action {
     ToggleSelected(String),
     /// Selects every message from the last one clicked to this one.
     SelectRange(String),
+    /// Selects the messages a mouse drag has swept, from the row it began on
+    /// to the row under the pointer, starting a selection if none was open.
+    SweepMessages {
+        anchor: String,
+        to: String,
+    },
+    /// The mouse button that swept messages was released.
+    EndSweep,
     /// Leaves selection mode.
     CancelSelection,
     /// Loads an outgoing message into the composer for editing.
     Edit(String),
     CancelEdit,
-    /// Revokes an outgoing message for everyone.
-    DeleteForEveryone(String),
-    /// Deletes a message locally.
-    DeleteForMe(String),
+    /// Revokes an outgoing message for everyone. The chat travels with the
+    /// message because the reader may switch chats before confirming.
+    DeleteForEveryone {
+        chat: ChatId,
+        id: String,
+    },
+    /// Deletes a message locally, in the chat it belongs to.
+    DeleteForMe {
+        chat: ChatId,
+        id: String,
+    },
     /// Opens the attachment picker for the current chat.
     Attach,
     /// Opens or closes the composer tools menu.
@@ -1505,10 +1601,16 @@ pub enum Action {
     DownloadUpdate,
     InstallUpdate,
     SetTheme(crate::settings::ThemeChoice),
+    /// Draws the interface in the platform's font or in the bundled Inter.
+    SetFont(crate::settings::FontChoice),
     SetInterfaceLanguage(Option<crate::i18n::Locale>),
     SetCustomTheme(String),
     SetWallpaperColor(crate::settings::WallpaperColor),
     SetWallpaperDoodles(bool),
+    /// Asks for an image to use as the chat wallpaper.
+    PickWallpaperImage,
+    /// Goes back to the wallpaper colour and deletes the copied image.
+    RemoveWallpaperImage,
     ReloadThemes,
     OpenThemesFolder,
     SettingsChanged,
@@ -1545,6 +1647,20 @@ pub enum Action {
     },
     /// Asks for a picture and makes it our profile picture.
     PickProfilePicture,
+    /// Opens the group name editor in the group info dialog, starting from
+    /// the current name.
+    EditGroupName(String),
+    /// Closes the group name editor without renaming.
+    CloseGroupName,
+    /// Renames a group on WhatsApp; the editor closes.
+    SetGroupName {
+        chat: ChatId,
+        name: String,
+    },
+    /// Asks for a picture and makes it the group's photo.
+    PickGroupPicture(ChatId),
+    /// Removes the group's photo.
+    RemoveGroupPicture(ChatId),
     /// Sets or resets (`None`) the folder for new downloads.
     SetDownloadFolder(Option<PathBuf>),
     /// Saves the proxy setting and reconnects. Empty follows the environment.
@@ -1557,6 +1673,21 @@ pub enum Action {
     PairWithPhone(String),
     /// Unlinks the device remotely and locally.
     Unlink,
+    /// Hides everything behind the app lock, when a password is set.
+    LockApp,
+    /// Tries the password typed on the lock screen.
+    UnlockApp,
+    /// Opens (`true`) or closes the lock screen's question about unlinking.
+    ForgotAppPassword(bool),
+    /// Unlinks this computer from the lock screen. The lock lifts, and its
+    /// password is forgotten, once WhatsApp has unlinked it.
+    UnlinkLockedApp,
+    /// Opens a password form in Settings, or closes it with `None`.
+    AppLockForm(Option<crate::app_lock::FormMode>),
+    /// Submits the Settings password form.
+    SubmitAppLockForm,
+    /// How long ZapFast may go unused before it locks.
+    SetAutoLock(crate::settings::AutoLock),
     Reconnect,
     /// Sets aside an archive whose key is gone and links again.
     StartOverArchive,
@@ -1644,6 +1775,25 @@ mod tests {
         chat.left = false;
         chat.participants = vec![me.into()];
         assert!(chat.can_leave(&[me]));
+    }
+
+    #[test]
+    fn group_info_is_editable_when_open_or_by_admins() {
+        let mut chat = super::Chat::new("1-2@g.us".into(), "Rust".into());
+        assert!(!chat.can_edit_info(), "unknown until the metadata says");
+        chat.info_locked = Some(false);
+        assert!(chat.can_edit_info(), "an open group lets every member edit");
+        chat.info_locked = Some(true);
+        assert!(!chat.can_edit_info(), "a locked group is for admins");
+        chat.admin = true;
+        assert!(chat.can_edit_info(), "which we are");
+        chat.left = true;
+        assert!(!chat.can_edit_info(), "a group we left is not ours to edit");
+
+        let mut direct = super::Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        direct.info_locked = Some(false);
+        direct.admin = true;
+        assert!(!direct.can_edit_info(), "only groups have group info");
     }
 
     #[test]
@@ -1920,12 +2070,14 @@ mod tests {
         let saved = Contact {
             id: "1".into(),
             full_name: Some("Ada".into()),
+            first_name: None,
             push_name: Some("ada l".into()),
         };
         assert_eq!(saved.label().as_deref(), Some("Ada"));
         let stranger = Contact {
             id: "2".into(),
             full_name: None,
+            first_name: None,
             push_name: Some("Bob".into()),
         };
         assert_eq!(stranger.label().as_deref(), Some("~Bob"));

@@ -1,6 +1,6 @@
 //! "Message info": who has received, read, or played one of our messages.
 
-use egui::{Align, CornerRadius, Frame, Layout, Margin, Sense, vec2};
+use egui::{Align, Frame, Layout, Margin, Sense, vec2};
 
 use super::widgets;
 use crate::app::App;
@@ -58,31 +58,39 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, chat: &str, id: &str) {
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.add_space(8.0);
-            preview(ui, &palette, &message);
-            if crate::model::ChatKind::from_id(chat) != crate::model::ChatKind::Group {
-                direct(app, ui, &message);
-                return;
-            }
-            let Some(receipts) = app
-                .message_receipts
-                .clone()
-                .filter(|receipts| receipts.chat == chat && receipts.message == id)
-            else {
-                widgets::rich_text(
-                    ui,
-                    &gettext(locale, "Loading…"),
-                    theme::regular(13.0),
-                    palette.secondary,
-                );
-                return;
-            };
-            group(app, ui, &receipts);
+            receipts(app, ui, chat, id, &message);
+            // The list ends clear of the dialog's edge rather than on it.
+            ui.add_space(8.0);
         });
     let bubble = super::conversation::bubble_id(chat, id);
     ui.ctx().data_mut(|data| {
         data.insert_temp(bubble.with("message-info-viewport"), area.inner_rect);
         data.insert_temp(bubble.with("message-info-content"), area.content_size);
     });
+}
+
+/// The message, then who received, read, or played it.
+fn receipts(app: &mut App, ui: &mut egui::Ui, chat: &str, id: &str, message: &Message) {
+    let palette = app.palette;
+    preview(ui, &palette, message);
+    if crate::model::ChatKind::from_id(chat) != crate::model::ChatKind::Group {
+        direct(app, ui, message);
+        return;
+    }
+    let Some(receipts) = app
+        .message_receipts
+        .clone()
+        .filter(|receipts| receipts.chat == chat && receipts.message == id)
+    else {
+        widgets::rich_text(
+            ui,
+            &gettext(app.locale, "Loading…"),
+            theme::regular(13.0),
+            palette.secondary,
+        );
+        return;
+    };
+    group(app, ui, &receipts);
 }
 
 /// The message as its bubble shows it, shortened to a few lines.
@@ -101,6 +109,8 @@ fn preview(ui: &mut egui::Ui, palette: &Palette, message: &Message) {
         vec2(ui.available_width(), 0.0),
         Layout::right_to_left(Align::Min),
         |ui| {
+            // Room for the tail, which reaches out past the bubble's side.
+            ui.add_space(widgets::TAIL_WIDTH);
             bubble(ui, palette, message, text, width);
         },
     );
@@ -113,9 +123,9 @@ fn bubble(
     text: widgets::Line,
     width: f32,
 ) {
-    Frame::new()
-        .fill(palette.bubble_out)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
+    // Drawn as the chat draws our own messages: shadow, raised edge, tail.
+    let backdrop = ui.painter().add(egui::Shape::Noop);
+    let shown = Frame::new()
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             let clock = ui.painter().layout_no_wrap(
@@ -140,6 +150,15 @@ fn bubble(
                 palette.secondary,
             );
         });
+    ui.painter().set(
+        backdrop,
+        widgets::bubble_shape(
+            palette,
+            shown.response.rect,
+            palette.bubble_out,
+            Some(widgets::Side::Right),
+        ),
+    );
 }
 
 /// A direct chat's single recipient: the times its ticks turned.
@@ -166,7 +185,7 @@ fn direct(app: &App, ui: &mut egui::Ui, message: &Message) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-            theme::paint_icon(ui, Icon::CheckCheck, rect, 18.0, color);
+            theme::paint_icon(ui, Icon::DeliveryTicks, rect, 18.0, color);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 theme::text(ui, label, theme::medium(14.0), palette.text);
@@ -263,7 +282,7 @@ fn section(
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-        theme::paint_icon(ui, Icon::CheckCheck, rect, 16.0, color);
+        theme::paint_icon(ui, Icon::DeliveryTicks, rect, 16.0, color);
         theme::text(ui, title, theme::semibold(14.0), palette.text);
     });
     if recipients.is_empty() {

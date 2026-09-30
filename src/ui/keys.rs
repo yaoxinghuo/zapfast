@@ -10,6 +10,10 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         preview_keys(app, ctx);
         return;
     }
+    if app.video_expanded {
+        video_keys(app, ctx);
+        return;
+    }
     let editing_text = ctx.text_edit_focused();
     let find = find_action(app);
     let mut actions = Vec::new();
@@ -26,6 +30,14 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             Action::FocusSearch,
         );
         key(Modifiers::COMMAND, Key::F, find);
+        // Before Ctrl+L, which would also match it with Shift held.
+        if app.settings.app_lock_hash.is_some() {
+            key(
+                Modifiers::COMMAND | Modifiers::SHIFT,
+                Key::L,
+                Action::LockApp,
+            );
+        }
         key(Modifiers::COMMAND, Key::K, Action::FocusSearch);
         if app.is_linked() {
             key(
@@ -105,6 +117,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     if escape {
         if app.show_update {
             actions.push(Action::CloseUpdate);
+        } else if app.dialog.is_some() && app.group_name_edit.is_some() {
+            // Cancels the group rename and keeps the dialog open.
+            actions.push(Action::CloseGroupName);
         } else if app.dialog.is_some() {
             actions.push(Action::CloseDialog);
         } else if app.recording.is_some() {
@@ -230,7 +245,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
 /// reports whether one was found. `consume_key` is unsuitable here: it also
 /// matches the key with Shift or Alt held, and a plain binding must leave
 /// those combinations, such as Shift+Home for text selection, alone.
-fn take_plain(input: &mut egui::InputState, key: Key) -> bool {
+pub(super) fn take_plain(input: &mut egui::InputState, key: Key) -> bool {
     let mut taken = false;
     input.events.retain(|event| {
         if taken {
@@ -285,6 +300,57 @@ fn preview_keys(app: &mut App, ctx: &egui::Context) {
     app.actions.extend(actions);
 }
 
+/// Handles keys while a video covers the window: Escape puts it back, Space
+/// plays or pauses, M mutes, and the arrows jump five seconds. No chat
+/// shortcut runs and nothing is typed into the composer under it.
+fn video_keys(app: &mut App, ctx: &egui::Context) {
+    let Some((message, path)) = app
+        .video
+        .message()
+        .map(str::to_owned)
+        .zip(app.video.path().map(std::path::Path::to_owned))
+    else {
+        return;
+    };
+    let status = app.video.status(&message);
+    let jump = |seconds: f32| {
+        let status = status.as_ref()?;
+        let total = status.total.as_secs_f32();
+        (total > 0.0).then(|| Action::SeekVideo {
+            message: message.clone(),
+            fraction: ((status.position.as_secs_f32() + seconds) / total).clamp(0.0, 1.0),
+        })
+    };
+    let mut actions = Vec::new();
+    ctx.input_mut(|input| {
+        if input.consume_key(Modifiers::NONE, Key::Escape) {
+            actions.push(Action::CollapseVideo);
+        }
+        if input.consume_key(Modifiers::NONE, Key::Space) {
+            actions.push(Action::PlayVideo {
+                message: message.clone(),
+                path: path.clone(),
+            });
+        }
+        if input.consume_key(Modifiers::NONE, Key::M) {
+            actions.push(Action::ToggleVideoSound);
+        }
+        if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+            actions.extend(jump(-5.0));
+        }
+        if input.consume_key(Modifiers::NONE, Key::ArrowRight) {
+            actions.extend(jump(5.0));
+        }
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_)
+            )
+        });
+    });
+    app.actions.extend(actions);
+}
+
 /// Ctrl+F searches the open chat, as in WhatsApp, the chat list when no
 /// chat is open, and the settings on the Settings page.
 fn find_action(app: &App) -> Action {
@@ -328,6 +394,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl++ / Ctrl+-", "Zoom in / out"),
     ("Ctrl+0", "Reset zoom"),
     ("? / Ctrl+/", "Keyboard shortcuts (? when not typing)"),
+    ("Ctrl+Shift+L", "Lock ZapFast (with an app lock password)"),
     ("Ctrl+W", "Close the window (ZapFast remains in the tray)"),
     ("Ctrl+Q", "Quit"),
 ];

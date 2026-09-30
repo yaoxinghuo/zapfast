@@ -107,7 +107,9 @@ protocol. These notes are for coding agents and new contributors.
   palettes off the UI thread, and the app caches the last usable choice in
   settings, with the palettes shared with Spotifast embedded as defaults. On Linux filesystem notifications reload the catalog and the active
   Omarchy palette without a repaint timer; following Omarchy does not require
-  packaged assets. Native packages ship optional hooks and templates, preserving
+  packaged assets. Changing `contrib/omarchy/zapfast.json.tpl` means saving the
+  old text in `contrib/omarchy/previous/` and listing it in
+  `omarchy_previous_templates`, so untouched installed copies are upgraded. Native packages ship optional hooks and templates, preserving
   existing per-user files. `reload-themes` uses the single-instance channel
   without opening a window.
 - `src/theme.rs` owns colours, fonts, and icons; `src/ui/widgets.rs` the
@@ -115,11 +117,20 @@ protocol. These notes are for coding agents and new contributors.
   and in the `fastframe_icons::icons!` table; an icon fastframe-icons already
   ships is named there as `lucide "name"` instead of copied.
 - `src/markup.rs` turns WhatsApp's text markup, links, and mentions into an
-  egui `LayoutJob`; `src/emoji.rs` swaps every emoji for a placeholder
-  glyph at layout time and paints the desktop's colour emoji bitmap over
-  it afterwards (resolving sequences through the font's GSUB ligatures).
-  Any text that can hold an emoji goes through `widgets::line` /
-  `widgets::rich_text` or `markup::layout`, never a bare `Label`.
+  egui `LayoutJob`; `src/emoji.rs` hands emoji to fastframe-emoji, which
+  swaps every emoji for a placeholder glyph at layout time and paints the
+  platform's picture over it afterwards (Apple Color Emoji, Segoe UI Emoji
+  through DirectWrite, or the desktop's bitmap emoji font, with the bundled
+  Noto behind them). New pictures are drawn on its worker thread; tests and
+  demo builds draw them inside the frame. The interface font is the
+  platform's own (`fastframe_fonts::Primary::System`), and Inter in tests.
+  fastframe-emoji's `EmojiPlugin` (added in `App::attach`) colours the
+  emoji in every other egui text: labels, menus, tooltips, text fields. It
+  leaves placeholders and `editor_job` glyphs alone, so the two never paint
+  one emoji twice. Message text and chat names still go through
+  `widgets::line` / `widgets::rich_text` or `markup::layout`: their
+  placeholders keep the emoji-only sizing and let `transcript::refine`
+  put copied emoji back.
 - `src/animation.rs` plays animated stickers and GIFs: WebP/GIF frames
   decode in-process, and so do MP4s (the `mp4` crate demuxes, `openh264`
   decodes the H.264 WhatsApp uses, samples converted from AVCC to Annex
@@ -160,12 +171,25 @@ protocol. These notes are for coding agents and new contributors.
   Selection galleys share the message viewport's horizontal bounds while
   retaining their glyph positions: otherwise egui considers short incoming
   and outgoing messages separate columns and will not sweep across them.
+  Messages themselves are swept by a drag that starts on the strip beside
+  the bubbles (which senses drags beneath the text), or anywhere on a row
+  while selecting (the row's pick target sits above the text). `App::sweep`
+  keeps the anchor and the selection it started from; the view maps the
+  pointer's y to the last laid-out row above it each frame and the app
+  selects by message order, so rows the list skipped during edge scroll
+  count. Releasing the button ends the sweep, whichever widget held it.
 - Group names and members come from `groups().get_metadata`, asked one
   turn at a time (two per 5 s tick, `pump_group_info`): dozens of unnamed
   groups arrive with history sync and a burst of queries hits the
   server's rate limit, which once left groups called "Group" forever.
   Failures back off (30 s doubling, seven tries); item-not-found,
   forbidden and not-authorized are final and stop the asking.
+  The same metadata stores `is_locked` and our admin role
+  (`chats.info_locked`, NULL until known, and `chats.group_admin`);
+  `Chat::can_edit_info` gates renaming and the group photo in the group
+  dialog. A rename lands only after WhatsApp accepts it, and bumps
+  `subject_generation` so a metadata answer asked for earlier cannot restore
+  the old subject. A refusal re-asks the metadata to relearn the rights.
 - A download that answers 403/404/410 goes through
   `client.media_reupload().request(..)` (a server-error receipt; WhatsApp
   has the phone re-upload and answers with a fresh `direct_path`) and is
@@ -249,6 +273,14 @@ protocol. These notes are for coding agents and new contributors.
   recipient. Never promote a group from one reader, apply a receipt to earlier
   messages, or infer a historical audience from current membership. History
   trusts the phone's aggregate status, not a partial `user_receipt` list.
+- The app lock (`src/app_lock.rs`, `ui/lock.rs`) is a local screen lock, not
+  encryption, and independent of the locked-chats code. Settings keep only a
+  salted PBKDF2 verifier, checked and made on a thread. While locked,
+  `ui::show` draws only the lock screen, `App::apply` drops every action
+  outside `allowed_while_locked` (a clicked notification's message waits for
+  the unlock), `window_focused` stays false so nothing is marked read, and
+  notifications say only "New message". Unlinking (`LoggedOut`) forgets the
+  password, which is how a forgotten one is recovered.
 - Private read-state writes all use the `regular_low` app-state collection.
   `backend::read_sync` permits one at a time and backs off the whole queue after
   failure; per-chat retry queues would repeatedly rebuild the same failed
@@ -276,7 +308,8 @@ egui pitfalls this code has already hit:
   `ui/keys.rs`. Layouts that put another character on the shifted key never
   produce either spelling; `Alt+↑/↓` is the layout-independent way to switch
   chats. A long label in `SHORTCUTS` widens the dialog's key column and
-  truncates the descriptions at the default window size.
+  leaves its descriptions less room to wrap in; the dialog takes two columns
+  in a wide window and scrolls in a short one.
 - `with_layout(..., Align::Center)` directly inside a vertical container
   claims the whole available height; wrap it in `ui.horizontal`.
 - `ui.horizontal` inside a right-aligned bubble lays out right to left;
@@ -286,9 +319,9 @@ egui pitfalls this code has already hit:
   double-click on either replies; the body keeps it for selecting the word.
 - `Popup::context_menu` opens on the *response's* right-click, which those
   inner widgets take for themselves; the bubble reads the right-click from
-  the input over the part of its rect inside the transcript viewport (the chat
-  header shares its layer) and opens `Popup::menu` itself, so the menu
-  comes up anywhere on the message.
+  the input over its row (the bubble and the strip beside it) inside the
+  transcript viewport (the chat header shares its layer) and opens
+  `Popup::menu` itself, so the menu comes up anywhere on the message.
 
 ## Branches
 

@@ -1,6 +1,6 @@
 [package]
 name = "zapfast"
-version = "0.16.5"
+version = "0.18.2"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -41,8 +41,8 @@ directories = "6"
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "glow", "default_fonts", "links", "wayland", "x11", "persistence"] }
 egui = "0.36"
 egui_extras = { version = "0.36", features = ["file", "image", "svg", "webp", "gif"] }
-# Reads the colour emoji font's bitmaps and ligatures. Keep skrifa aligned with
-# epaint to avoid compiling two versions.
+# Reads the colour emoji font's bitmaps for the demo tour's GIF fixtures. Keep
+# skrifa aligned with epaint to avoid compiling two versions.
 skrifa = "0.44"
 # Decodes JPEG, PNG, WebP, and GIF images.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
@@ -121,26 +121,30 @@ libwebp-sys2 = { version = "0.2", features = ["1_2"] }
 # Shared foundation of Carmine's egui apps (github.com/crmne/fastframe). Every
 # crate comes from the same revision.
 # Bundled gettext catalogs: lookups and system language detection.
-fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
+fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
 # The icons! table, a loader that survives reduce_texture_memory, and the Lucide
 # icons shared with Spotifast.
-fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
-# Bundled Inter with tabular figures, and installed fonts for other scripts.
-fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
+# The platform's interface font (Inter where there is none), and installed
+# fonts for other scripts.
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
+# Colour emoji in the platform's own style, with the bundled Noto behind
+# them, drawn off the interface thread.
+fastframe-emoji = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
 # Follows the desktop's hinting and glyph coverage, live through the portal.
-fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1", features = ["watch"] }
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2", features = ["watch"] }
 # Palette files, the shared presets, and following Omarchy's theme live.
-fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
+fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
 # Logs to stderr and a per-run file, and records panics without their payload.
-fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
+fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
 # The tray item: StatusNotifier on Linux, tray-icon on Windows and macOS.
-fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
+fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
 # Keeps ZapFast running without a window and recovers off-screen windows.
-fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
+fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
 # Centres the macOS traffic lights on ZapFast's own header.
-fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1" }
+fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2" }
 # Self-update from GitHub releases with signed checksums, a helper and rollback.
-fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1", features = ["reqwest"] }
+fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2", features = ["reqwest"] }
 
 [patch.crates-io]
 # crmne/egui apps-0.36, shared with Spotifast, RekordFlash and TonePush: egui
@@ -164,11 +168,12 @@ epaint_default_fonts = { git = "https://github.com/crmne/egui", rev = "0b431145c
 # crmne/winit apps-0.30, shared with the same apps: winit 0.30.13 plus Wayland
 # `Occluded` for the xdg-shell suspended state with commits on the app's behalf
 # while it isn't presenting (rust-windowing/winit#4709, #4710), macOS Quit
-# through close requests (winit#4692), and file drag and drop on Wayland
-# through the data device (#178), which upstream only has in 0.31's new API
-# (winit#4571), and Windows drags between monitors of different scale
-# (winit#4694). eframe from the fork above calls the Occluded API.
-winit = { git = "https://github.com/crmne/winit", rev = "f4fed12c0b1426ee00ba56cd60898b309d9d917b" }
+# through close requests (winit#4692), and Windows drags between monitors of
+# different scale (winit#4694). eframe from the fork above calls the Occluded
+# API. File drops on Wayland (#178) are reverted: they gave winit a second
+# data device, and Hyprland sends the clipboard only to a client's first, so
+# pasting stopped working (crmne/spotifast#614).
+winit = { git = "https://github.com/crmne/winit", rev = "544a73716c7a54c916d97d6c86c0b1bdaa81234e" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-tokio-crypto-rust"] }
@@ -245,4 +250,4 @@ opt-level = 2
 [build-dependencies]
 # Compiles the PO catalogs to Rust, leaving out unfinished entries. Ordinary
 # builds do not need gettext tools.
-fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.1.1", features = ["build"] }
+fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.2.2", features = ["build"] }

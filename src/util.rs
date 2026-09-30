@@ -16,19 +16,36 @@ fn image_uri_for_platform(path: &str, windows: bool) -> String {
     format!("file://{}{path}", if windows { "/" } else { "" })
 }
 
+/// The local time zone.
+fn zone() -> jiff::tz::TimeZone {
+    #[cfg(test)]
+    if let Some(clock) = fixed_clock::get() {
+        return clock.zone;
+    }
+    jiff::tz::TimeZone::system()
+}
+
 /// Converts a Unix timestamp to local time.
 fn zoned(unix_seconds: i64) -> Option<Zoned> {
     let timestamp = Timestamp::from_second(unix_seconds).ok()?;
-    Some(timestamp.to_zoned(jiff::tz::TimeZone::system()))
+    Some(timestamp.to_zoned(zone()))
 }
 
 /// Today's local date.
 pub fn today() -> Date {
+    #[cfg(test)]
+    if let Some(when) = fixed_clock::get().and_then(|clock| zoned(clock.now)) {
+        return when.date();
+    }
     Zoned::now().date()
 }
 
 /// Whether the system shows times on a 12-hour clock. Read once per run.
 pub fn twelve_hour_clock() -> bool {
+    #[cfg(test)]
+    if let Some(clock) = fixed_clock::get() {
+        return clock.twelve_hour;
+    }
     static TWELVE_HOUR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TWELVE_HOUR.get_or_init(clock_preference::twelve_hour)
 }
@@ -243,6 +260,43 @@ pub fn moment_stamp(locale: Locale, unix_seconds: i64) -> String {
     }
 }
 
+/// A contact's last-seen line as WhatsApp words it: "last seen today at
+/// 14:05", "last seen yesterday at 14:05", a weekday within the week, and
+/// only the date before that. The time follows the system's clock.
+pub fn last_seen(locale: Locale, unix_seconds: i64) -> String {
+    let Some(when) = zoned(unix_seconds) else {
+        return String::new();
+    };
+    last_seen_relative_to(locale, today(), &when)
+}
+
+fn last_seen_relative_to(locale: Locale, today: Date, when: &Zoned) -> String {
+    use crate::i18n::gettext;
+    let date = when.date();
+    let time = hour_minute(when);
+    let days = today
+        .since(date)
+        .map(|span| span.get_days())
+        .unwrap_or(i32::MAX);
+    match days {
+        // A clock slightly ahead of ours still means today.
+        ..=0 => gettext(locale, "last seen today at {time}").replace("{time}", &time),
+        1 => gettext(locale, "last seen yesterday at {time}").replace("{time}", &time),
+        2..=6 => {
+            let weekday = weekday_name(locale, date.weekday());
+            // Mid-sentence, only English and German keep the capital.
+            let weekday = match locale {
+                Locale::English | Locale::German => weekday,
+                _ => weekday.to_lowercase(),
+            };
+            gettext(locale, "last seen {weekday} at {time}")
+                .replace("{weekday}", &weekday)
+                .replace("{time}", &time)
+        }
+        _ => gettext(locale, "last seen {date}").replace("{date}", &short_date(locale, date)),
+    }
+}
+
 /// Conversation day-separator label.
 pub fn day_label(locale: Locale, unix_seconds: i64) -> String {
     let Some(when) = zoned(unix_seconds) else {
@@ -269,7 +323,7 @@ pub fn day_key(unix_seconds: i64) -> Option<Date> {
 
 /// Unix-second half-open range for a local calendar day.
 pub fn day_bounds(date: Date) -> Option<(i64, i64)> {
-    day_bounds_in(date, &jiff::tz::TimeZone::system())
+    day_bounds_in(date, &zone())
 }
 
 /// [`day_bounds`] in `zone`. A day starts at its first instant, so one whose
@@ -361,7 +415,49 @@ pub fn long_date(locale: Locale, date: Date) -> String {
 
 /// The current time as a Unix timestamp.
 pub fn now() -> i64 {
+    #[cfg(test)]
+    if let Some(clock) = fixed_clock::get() {
+        return clock.now;
+    }
     Timestamp::now().as_second()
+}
+
+/// A clock for tests whose layout depends on the time: the current time, the
+/// time zone, and the clock format, fixed for the calling thread until the
+/// returned guard drops. Otherwise a sample built relative to now gains a day
+/// separator or wider times depending on when and where the test runs.
+#[cfg(test)]
+pub mod fixed_clock {
+    use std::cell::RefCell;
+
+    #[derive(Clone)]
+    pub struct Clock {
+        pub now: i64,
+        pub zone: jiff::tz::TimeZone,
+        pub twelve_hour: bool,
+    }
+
+    thread_local! {
+        static CLOCK: RefCell<Option<Clock>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<Clock> {
+        CLOCK.with(|clock| clock.borrow().clone())
+    }
+
+    /// Restores the thread's previous clock when dropped.
+    #[must_use]
+    pub struct Guard(Option<Clock>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CLOCK.with(|clock| *clock.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub fn set(clock: Clock) -> Guard {
+        Guard(CLOCK.with(|slot| slot.borrow_mut().replace(clock)))
+    }
 }
 
 /// Case- and accent-insensitive matching without changing displayed names.
@@ -474,36 +570,40 @@ pub fn hue(seed: &str) -> f32 {
 
 /// Embedded SVG app logo used across platform surfaces.
 const MARK: &[u8] = include_bytes!("../packaging/icons/zapfast.svg");
+/// The same mark without its rim and shading, which blur below this size.
+const SMALL_MARK: &[u8] = include_bytes!("../packaging/icons/zapfast-small.svg");
+const SMALL_BELOW: usize = 40;
 
 /// Rasterizes the logo to straight-alpha RGBA.
 pub fn app_icon_rgba(size: usize) -> Vec<u8> {
-    let side = size.max(1) as u32;
-    let rendered = resvg::usvg::Tree::from_data(MARK, &resvg::usvg::Options::default())
-        .ok()
-        .and_then(|tree| {
-            let mut pixmap = resvg::tiny_skia::Pixmap::new(side, side)?;
-            let scale = side as f32 / tree.size().width();
-            resvg::render(
-                &tree,
-                resvg::tiny_skia::Transform::from_scale(scale, scale),
-                &mut pixmap.as_mut(),
-            );
-            Some(
-                pixmap
-                    .pixels()
-                    .iter()
-                    .flat_map(|pixel| {
-                        let color = pixel.demultiply();
-                        [color.red(), color.green(), color.blue(), color.alpha()]
-                    })
-                    .collect::<Vec<u8>>(),
-            )
-        });
-    match rendered {
+    let mark = if size < SMALL_BELOW { SMALL_MARK } else { MARK };
+    match render_mark(mark, size) {
         Some(rgba) => rgba,
         // Fall back to an accent disc if the embedded SVG cannot render.
         None => plain_disc(size),
     }
+}
+
+fn render_mark(mark: &[u8], size: usize) -> Option<Vec<u8>> {
+    let side = size.max(1) as u32;
+    let tree = resvg::usvg::Tree::from_data(mark, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(side, side)?;
+    let scale = side as f32 / tree.size().width();
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Some(
+        pixmap
+            .pixels()
+            .iter()
+            .flat_map(|pixel| {
+                let color = pixel.demultiply();
+                [color.red(), color.green(), color.blue(), color.alpha()]
+            })
+            .collect(),
+    )
 }
 
 fn plain_disc(size: usize) -> Vec<u8> {
@@ -525,13 +625,17 @@ fn plain_disc(size: usize) -> Vec<u8> {
     rgba
 }
 
-/// Converts the logo to a monochrome macOS menu-bar template.
+/// Converts the logo to a monochrome macOS menu-bar template: the disc,
+/// with the bubble cut out of it.
 pub fn tray_template_rgba(size: usize) -> Vec<u8> {
-    let mut rgba = app_icon_rgba(size);
+    // The flat mark at every size: a template has no room for shading.
+    let mut rgba = render_mark(SMALL_MARK, size).unwrap_or_else(|| plain_disc(size));
+    // The disc's green against the ink's says how much of a pixel is disc.
+    const INK: f32 = 14.0;
+    const DISC: f32 = 168.0;
     for pixel in rgba.as_chunks_mut::<4>().0 {
-        if pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 {
-            pixel[3] = 0;
-        }
+        let disc = ((f32::from(pixel[1]) - INK) / (DISC - INK)).clamp(0.0, 1.0);
+        pixel[3] = (f32::from(pixel[3]) * disc).round() as u8;
         pixel[0] = 0;
         pixel[1] = 0;
         pixel[2] = 0;
@@ -703,6 +807,51 @@ mod tests {
         );
     }
 
+    /// Last seen reads as on the phone: the time today and yesterday, the
+    /// weekday and time within the week, and the date after that.
+    #[test]
+    fn last_seen_names_the_day_and_the_time() {
+        // Tuesday 14 November 2023, 22:13 UTC.
+        let when = Timestamp::from_second(1_700_000_000)
+            .expect("valid")
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        let date = when.date();
+        let time = time_of_day(22, 13, twelve_hour_clock());
+        let later = |days: i64| {
+            date.checked_add(jiff::Span::new().days(days))
+                .expect("date")
+        };
+        let english = |today| last_seen_relative_to(Locale::English, today, &when);
+        assert_eq!(english(date), format!("last seen today at {time}"));
+        assert_eq!(
+            english(date.yesterday().expect("date")),
+            format!("last seen today at {time}"),
+            "a timestamp slightly ahead of our clock is still today"
+        );
+        assert_eq!(english(later(1)), format!("last seen yesterday at {time}"));
+        assert_eq!(english(later(3)), format!("last seen Tuesday at {time}"));
+        assert_eq!(english(later(6)), format!("last seen Tuesday at {time}"));
+        assert_eq!(english(later(7)), "last seen 14 Nov 2023");
+        assert_eq!(english(later(30)), "last seen 14 Nov 2023");
+
+        // Mid-sentence weekdays keep their capital only where the language
+        // writes one.
+        assert_eq!(
+            last_seen_relative_to(Locale::Italian, later(3), &when),
+            format!("ultimo accesso martedì alle {time}")
+        );
+        assert_eq!(
+            last_seen_relative_to(Locale::German, later(3), &when),
+            format!("zuletzt online am Dienstag um {time}")
+        );
+        for locale in Locale::ALL {
+            for days in [0, 1, 3, 30] {
+                let line = last_seen_relative_to(locale, later(days), &when);
+                assert!(!line.contains('{'), "{locale:?} {days}: {line}");
+            }
+        }
+    }
+
     #[test]
     fn short_dates_take_whole_characters_in_every_locale() {
         for locale in Locale::ALL {
@@ -761,5 +910,33 @@ mod tests {
         assert_eq!(icon[3], 0);
         let middle = (16 * 32 + 16) * 4;
         assert_eq!(icon[middle + 3], 255);
+    }
+
+    /// The menu-bar template is the disc with the bubble cut out: solid in
+    /// the bubble's middle, clear along its outline and outside the disc.
+    #[test]
+    fn the_tray_template_cuts_the_bubble_out_of_the_disc() {
+        let size = 64;
+        let template = tray_template_rgba(size);
+        let alpha = |x: usize, y: usize| template[(y * size + x) * 4 + 3];
+        assert_eq!(alpha(0, 0), 0);
+        assert_eq!(alpha(32, 32), 255, "inside the bubble is disc");
+        assert_eq!(alpha(32, 4), 255, "so is the rim above it");
+        let outline = (0..32).map(|y| alpha(32, y)).min().unwrap();
+        assert!(outline < 40, "the outline is cut out: {outline}");
+        assert!(
+            template
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[..3] == [0, 0, 0])
+        );
+    }
+
+    /// Both marks render, the large one with its filters.
+    #[test]
+    fn both_marks_render() {
+        assert!(render_mark(MARK, 128).is_some());
+        assert!(render_mark(SMALL_MARK, 22).is_some());
     }
 }

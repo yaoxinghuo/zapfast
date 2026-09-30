@@ -374,6 +374,10 @@ pub enum Command {
     PickChatSound(ChatId),
     /// Asks for a folder for new downloads.
     PickDownloadFolder,
+    /// Asks for a wallpaper image and copies it into the state directory.
+    PickWallpaperImage,
+    /// Deletes the copied wallpaper image.
+    RemoveWallpaperImage,
     /// Changes our display name and About text; `None` keeps the current one.
     SetProfile {
         name: Option<String>,
@@ -383,6 +387,24 @@ pub enum Command {
     PickProfilePicture,
     /// Internal: a picked picture, cropped and encoded as JPEG.
     SetProfilePicture(Vec<u8>),
+    /// Renames a group on WhatsApp, for everyone in it.
+    SetGroupName {
+        chat: ChatId,
+        name: String,
+    },
+    /// Asks for a picture and makes it the group's photo.
+    PickGroupPicture(ChatId),
+    /// Sets the group's photo to a JPEG, or removes it with `None`.
+    SetGroupPicture {
+        chat: ChatId,
+        jpeg: Option<Vec<u8>>,
+    },
+    /// Internal: WhatsApp answered a change to a group's name or photo.
+    GroupEdited {
+        chat: ChatId,
+        edit: GroupEdit,
+        result: Result<(), String>,
+    },
     /// Internal: the server accepted a profile change.
     ProfileSaved {
         name: Option<String>,
@@ -396,6 +418,9 @@ pub enum Command {
         source: std::path::PathBuf,
         name: String,
     },
+    /// Opens the log, or shows it in its folder, off the interface thread;
+    /// only a failure reports back.
+    OpenLog(PathBuf),
     /// Reads and decodes an image file off the UI thread for clipboard writing.
     PrepareClipboardImage(PathBuf),
     /// Deletes an imported pack directory.
@@ -469,6 +494,7 @@ pub enum Command {
     ContactSaved {
         id: String,
         name: String,
+        first_name: Option<String>,
         error: Option<String>,
     },
     /// Checks a number, optionally saves it, and opens its chat.
@@ -618,6 +644,13 @@ pub enum Command {
         /// The chat's leave generation when this metadata was asked for. A
         /// snapshot older than a confirmed leave cannot undo it.
         leave_generation: u64,
+        /// Whether only admins may edit the group's name and photo.
+        info_locked: bool,
+        /// Whether we are an admin of the group.
+        admin: bool,
+        /// The chat's rename generation when this metadata was asked for. A
+        /// snapshot older than a rename made here cannot restore the old name.
+        subject_generation: u64,
     },
     /// Internal pairing-code result.
     PairCode {
@@ -649,6 +682,9 @@ pub enum Command {
     },
     /// Internal: followed channels and whether each is muted on the server.
     ChannelMutes(Vec<(String, bool)>),
+    /// Internal: the pictures of followed channels, or `None` when the list
+    /// could not be read.
+    ChannelPictures(Option<Vec<(ChatId, ChannelPicture)>>),
     /// Looks up the group behind an invite code without joining.
     PreviewInvite(String),
     /// Joins the group behind an invite code.
@@ -837,6 +873,8 @@ pub enum Event {
     },
     /// A folder chosen for new downloads.
     DownloadFolderPicked(std::path::PathBuf),
+    /// The copy of a chosen wallpaper image, or why it could not be used.
+    WallpaperImagePicked(Result<std::path::PathBuf, String>),
     /// An audio file chosen as a notification sound.
     NotificationSoundPicked {
         mention: bool,
@@ -883,6 +921,32 @@ pub enum Event {
         reason: Refusal,
     },
     Error(String),
+    /// A change to a group's name or photo went to WhatsApp (`saving`), or
+    /// WhatsApp answered it.
+    GroupSaving {
+        chat: ChatId,
+        saving: bool,
+    },
+}
+
+/// A change to a group's info, as sent to WhatsApp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupEdit {
+    /// The new subject.
+    Name(String),
+    /// A new photo, or none.
+    Picture { removed: bool },
+}
+
+/// Where a channel's picture lives on WhatsApp's media servers, as the
+/// channel's metadata names it. Channels have no profile picture a contact
+/// lookup would find.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelPicture {
+    /// The full-size picture's direct path.
+    pub full: Option<String>,
+    /// The small preview's direct path.
+    pub preview: Option<String>,
 }
 
 /// Why the worker refused a send.

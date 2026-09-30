@@ -30,8 +30,11 @@ pub const EDIT_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// WhatsApp revoke-for-everyone window.
 pub const REVOKE_WINDOW: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 
-/// Pause after which a trackpad gesture selects a new axis.
-const SCROLL_GESTURE_GAP: Duration = Duration::from_millis(150);
+/// Pause, in seconds, after which a trackpad gesture ends: a new one selects
+/// its own axis and pane, and a lifted one starts to glide. Measured on the
+/// frame's input clock (`InputState::time`), not on the wall clock, so a
+/// slow frame is not taken for a pause and tests can run it at their pace.
+const SCROLL_GESTURE_GAP: f64 = 0.15;
 /// Linux trackpad scroll multiplier.
 const TRACKPAD_SCALE: f32 = 1.8;
 /// Trackpad glide decay, minimum start speed, and stop speed.
@@ -43,6 +46,107 @@ const GLIDE_STOP: f32 = 40.0;
 enum ScrollAxis {
     Horizontal,
     Vertical,
+}
+
+/// A pane that scrolls on its own, which a scroll gesture stays with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollPane {
+    /// The chat list, or its collapsed avatar column.
+    Chats,
+    /// The open chat's messages.
+    Messages,
+}
+
+/// Keeps a scroll gesture, glide included, with the pane it began over
+/// (#274). egui scrolls whichever scroll area is under the pointer, so a
+/// gesture that drifted over the other pane moved that one instead, and so
+/// did the rest of its glide. The panes say where they are each frame; while
+/// a gesture lasts, vertical scrolling with the pointer away from its pane is
+/// taken from egui and handed to that pane, which applies it itself.
+#[derive(Default)]
+pub struct ScrollRoute {
+    /// Where each pane was drawn in the last frame.
+    placed: Vec<(ScrollPane, egui::Rect)>,
+    /// Where each pane is drawn in this frame. Behind a lock so a view can
+    /// record it while other parts of the app are borrowed.
+    placing: std::sync::Mutex<Vec<(ScrollPane, egui::Rect)>>,
+    /// The pane the gesture under way began over.
+    owner: Option<ScrollPane>,
+    /// When the gesture last had input, in egui input time.
+    last_input: Option<f64>,
+    /// Whether the gesture's fingers lifted: new input starts another.
+    lifted: bool,
+    /// Scrolling taken for the owner this frame.
+    carry: Option<(ScrollPane, f32)>,
+}
+
+impl ScrollRoute {
+    /// Records where `pane` is drawn this frame.
+    pub fn place(&self, pane: ScrollPane, rect: egui::Rect) {
+        self.placing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((pane, rect));
+    }
+
+    /// The vertical scrolling taken for `pane` from over another place this
+    /// frame, for the pane to apply with `Ui::scroll_with_delta`.
+    pub fn take(&mut self, pane: ScrollPane) -> f32 {
+        match self.carry {
+            Some((to, delta)) if to == pane => {
+                self.carry = None;
+                delta
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Picks the gesture's pane and takes its scrolling from elsewhere.
+    /// `moved` is whether wheel input arrived this frame, `lifted` whether
+    /// the fingers left the trackpad, and `gliding` whether the app's own
+    /// glide is still adding to the scroll.
+    fn route(&mut self, ctx: &egui::Context, moved: bool, lifted: bool, gliding: bool) {
+        self.placed = std::mem::take(self.placing.get_mut().unwrap_or_else(|p| p.into_inner()));
+        self.carry = None;
+        let now = ctx.input(|input| input.time);
+        // Floating layers, such as menus and dialogs, are no pane.
+        let under = ctx
+            .input(|input| input.pointer.hover_pos())
+            .filter(|pos| {
+                ctx.layer_id_at(*pos)
+                    .is_none_or(|layer| layer.order == egui::Order::Background)
+            })
+            .and_then(|pos| {
+                self.placed
+                    .iter()
+                    .find(|(_, rect)| rect.contains(pos))
+                    .map(|(pane, _)| *pane)
+            });
+        let recent = self
+            .last_input
+            .is_some_and(|at| now - at < SCROLL_GESTURE_GAP);
+        if moved {
+            if self.lifted || !recent {
+                self.owner = under;
+            }
+            self.last_input = Some(now);
+            self.lifted = false;
+        }
+        self.lifted |= lifted;
+        let settling = ctx.input(|input| input.smooth_scroll_delta != egui::Vec2::ZERO);
+        if !moved && !gliding && !settling && !recent {
+            self.owner = None;
+        }
+        let Some(owner) = self.owner else {
+            return;
+        };
+        if under != Some(owner) && self.placed.iter().any(|(pane, _)| *pane == owner) {
+            let delta = ctx.input_mut(|input| std::mem::take(&mut input.smooth_scroll_delta.y));
+            if delta != 0.0 {
+                self.carry = Some((owner, delta));
+            }
+        }
+    }
 }
 /// Delay after the last keystroke before clearing typing state.
 const COMPOSING_TIMEOUT: Duration = Duration::from_secs(4);
@@ -193,6 +297,39 @@ pub struct Presence {
     pub last_seen: Option<i64>,
 }
 
+/// Messages swept by dragging over them (#246): everything from the row
+/// the drag began on to the row under the pointer joins what was selected
+/// before, by the chat's order, so rows the list skipped count too.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Sweep {
+    pub chat: ChatId,
+    pub anchor: String,
+    /// The row under the pointer when the sweep last moved.
+    pub to: String,
+    base: Vec<String>,
+}
+
+/// Adds the messages from `anchor` to `to` to a selection, in either
+/// direction, keeping the chat's order. Deleted and placeholder messages
+/// cannot be forwarded, so they stay out.
+fn add_range(messages: &[Message], ids: &mut Vec<String>, anchor: &str, to: &str) {
+    let position = |id: &str| messages.iter().position(|message| message.id == id);
+    let (Some(from), Some(to)) = (position(anchor), position(to)) else {
+        return;
+    };
+    let (from, to) = (from.min(to), from.max(to));
+    for message in &messages[from..=to] {
+        if !matches!(
+            message.content,
+            Content::Revoked | Content::PhoneOnly { .. } | Content::Unsupported { .. }
+        ) && !ids.contains(&message.id)
+        {
+            ids.push(message.id.clone());
+        }
+    }
+    ids.sort_by_key(|id| position(id).unwrap_or(usize::MAX));
+}
+
 /// The "unread messages" divider of the open chat. It stays until another
 /// chat opens, like on the phone.
 #[derive(Clone, Debug, PartialEq)]
@@ -215,7 +352,14 @@ pub struct App {
     pub palette: Palette,
     pub custom_themes: theme::Catalog,
     applied_dark: Option<bool>,
+    /// Reveals a new palette from the middle of the window outwards.
+    theme_transition: fastframe_theme::Transition,
+    /// Whether palette changes are revealed. Off in tests, whose frames send
+    /// no screenshots and would hold the old palette.
+    pub reveal_theme_changes: bool,
     zoom_applied: bool,
+    /// The wallpaper image named in the settings, decoded off this thread.
+    pub wallpaper_image: crate::wallpaper::CustomImage,
 
     pub link: LinkStatus,
     /// Whether link-time history sync is active.
@@ -255,6 +399,8 @@ pub struct App {
     composing: bool,
     last_keystroke: Option<Instant>,
     pub search: String,
+    /// Chat result reached with the arrow keys in the global search field.
+    pub search_selected: Option<ChatId>,
     /// Message search results, newest first.
     pub search_hits: Vec<Message>,
     /// The search pane beside the open chat: its query, day filter and the
@@ -305,6 +451,8 @@ pub struct App {
     pub selection: Option<(ChatId, Vec<String>)>,
     /// The message a Shift-click range starts from.
     selection_anchor: Option<String>,
+    /// Messages being swept with the mouse held down, if any.
+    pub(crate) sweep: Option<Sweep>,
     avatars: HashMap<String, Option<PathBuf>>,
     avatar_requests: HashSet<String>,
     /// Full-size profile pictures for info dialogs.
@@ -319,6 +467,10 @@ pub struct App {
     /// Picker anchor at the composer button.
     pub picker_anchor: Option<egui::Rect>,
     pub picker_search: String,
+    /// Recent emoji as they stood when the emoji picker opened. The row keeps
+    /// that order while the picker is open, so the same emoji can be sent
+    /// again from where it was; it catches up the next time it opens (#294).
+    pub picker_recent: Option<Vec<String>>,
     /// Whether the newly opened picker should focus search.
     pub picker_focus: bool,
     /// Message the full emoji reaction picker is targeting.
@@ -369,6 +521,8 @@ pub struct App {
     pauses_media: bool,
     /// Image currently shown in the native preview.
     pub image_preview: Option<PreviewState>,
+    /// Whether the loaded video covers the window instead of its bubble.
+    pub video_expanded: bool,
     /// Voice messages with a sent played receipt.
     played_told: HashSet<String>,
     /// Message bodies registered for transcript copy formatting.
@@ -409,12 +563,16 @@ pub struct App {
     pub sticker_preview_pending: bool,
     /// A pack just created here, selected once the backend lists it.
     sticker_pack_created: Option<String>,
-    scroll_lock: Option<(ScrollAxis, Instant)>,
+    /// The locked axis and when its gesture last moved, in egui input time.
+    scroll_lock: Option<(ScrollAxis, f64)>,
     scroll_from_trackpad: bool,
     scroll_history: egui::util::History<egui::Vec2>,
     scroll_accum: egui::Vec2,
     glide: Option<egui::Vec2>,
-    scroll_last_event: Option<Instant>,
+    /// When the trackpad gesture last moved, in egui input time.
+    scroll_last_event: Option<f64>,
+    /// Keeps a scroll gesture with the pane it began over.
+    pub scroll_route: ScrollRoute,
 
     pub page: Page,
     pub dialog: Option<Dialog>,
@@ -426,6 +584,10 @@ pub struct App {
     pub interactive_sending: HashSet<(ChatId, String)>,
     /// Contact-name editor buffers.
     pub contact_edit: Option<(String, String)>,
+    /// The group name being typed in the group info dialog.
+    pub group_name_edit: Option<String>,
+    /// Groups whose name or photo change WhatsApp has not answered yet.
+    pub group_saving: HashSet<ChatId>,
     /// New-contact buffers and lookup state.
     pub new_contact_phone: String,
     pub new_contact_name: String,
@@ -493,6 +655,9 @@ pub struct App {
     /// Cross-thread window repaint handle.
     waker: Waker,
     tray: Option<fastframe_tray::Tray>,
+    /// Whether the tray menu offers "Lock ZapFast": whether an app lock
+    /// password was set when it last changed.
+    tray_lockable: bool,
     /// Whether the app is running without a window.
     pub window_hidden: bool,
     /// Whether window close should keep the process running.
@@ -507,6 +672,9 @@ pub struct App {
     /// Unread count on the taskbar icon, where the desktop reads it. `None`
     /// for demo and test runs, which must not touch the real taskbar.
     badge: Option<crate::notify::Badge>,
+    /// The app lock: whether the window shows only the lock screen, the
+    /// inactivity count, and the Settings password form.
+    pub app_lock: crate::app_lock::AppLock,
 }
 
 /// A message that flashes after a jump to it, as WhatsApp does.
@@ -617,6 +785,7 @@ impl fastframe_shell::Resident for App {
 }
 
 const TRAY_SHOW: &str = "show";
+const TRAY_LOCK: &str = "lock";
 const TRAY_QUIT: &str = "quit";
 
 /// What a tray click asks for: a left click on Linux and macOS, or the menu's
@@ -628,14 +797,19 @@ fn tray_action(event: fastframe_tray::Event, window_hidden: bool) -> Option<Acti
         Event::Show => Action::ShowWindow,
         Event::Toggle | Event::Menu(TRAY_SHOW) if window_hidden => Action::ShowWindow,
         Event::Toggle | Event::Menu(TRAY_SHOW) => Action::HideWindow,
+        Event::Menu(TRAY_LOCK) => Action::LockApp,
         Event::Menu(TRAY_QUIT) => Action::Quit,
         Event::Menu(_) => return None,
     })
 }
 
-/// The tray item: ZapFast's icon, and a menu to show or hide the window and
-/// to quit.
-fn tray_config() -> fastframe_tray::Config {
+/// The tray item: ZapFast's icon, and a menu to show or hide the window,
+/// to lock it while an app lock password is set, and to quit. The title and
+/// the menu never name a chat, so they are safe while locked.
+///
+/// "Lock ZapFast" is always in the menu, hidden without a password;
+/// `App::sync_tray` shows or hides it as the password is set or removed.
+fn tray_config(lockable: bool) -> fastframe_tray::Config {
     use fastframe_tray::MenuItem;
     fastframe_tray::Config {
         id: "zapfast",
@@ -644,6 +818,7 @@ fn tray_config() -> fastframe_tray::Config {
         template_icon: Some(crate::util::tray_template_rgba),
         menu: vec![
             MenuItem::action(TRAY_SHOW, "Show or hide ZapFast"),
+            MenuItem::action(TRAY_LOCK, "Lock ZapFast").visible(lockable),
             MenuItem::Separator,
             MenuItem::action(TRAY_QUIT, "Quit"),
         ],
@@ -682,7 +857,8 @@ impl App {
             .ok();
         if options.tray {
             let waker = waker.clone();
-            app.tray = fastframe_tray::Tray::spawn(tray_config(), move || waker.wake());
+            app.tray =
+                fastframe_tray::Tray::spawn(tray_config(app.tray_lockable), move || waker.wake());
         }
         // The clock preference may run a helper on Linux; keep it off the
         // first frame.
@@ -734,6 +910,9 @@ impl App {
             });
         let open_chat = settings.last_chat.clone();
         let locale = crate::i18n::resolve(settings.interface_language);
+        // With a password set, ZapFast starts locked.
+        let app_lock = crate::app_lock::AppLock::new(settings.app_lock_hash.is_some());
+        let tray_lockable = settings.app_lock_hash.is_some();
         let mut app = Self {
             dirs,
             settings,
@@ -744,7 +923,10 @@ impl App {
             palette,
             custom_themes: theme::Catalog::default(),
             applied_dark: None,
+            theme_transition: fastframe_theme::Transition::default(),
+            reveal_theme_changes: !cfg!(test),
             zoom_applied: false,
+            wallpaper_image: crate::wallpaper::CustomImage::default(),
             link: LinkStatus::Starting,
             syncing: false,
             sync_percent: None,
@@ -771,6 +953,7 @@ impl App {
             composing: false,
             last_keystroke: None,
             search: String::new(),
+            search_selected: None,
             search_hits: Vec::new(),
             chat_search_open: false,
             chat_search: String::new(),
@@ -799,6 +982,7 @@ impl App {
             unread_divider: None,
             selection: None,
             selection_anchor: None,
+            sweep: None,
             avatars: HashMap::new(),
             avatar_requests: HashSet::new(),
             avatars_full: HashMap::new(),
@@ -808,6 +992,7 @@ impl App {
             picker: None,
             picker_anchor: None,
             picker_search: String::new(),
+            picker_recent: None,
             picker_focus: false,
             reaction_target: None,
             reaction_anchor: None,
@@ -831,6 +1016,7 @@ impl App {
             media_hold: None,
             pauses_media: false,
             image_preview: None,
+            video_expanded: false,
             played_told: HashSet::new(),
             copy_rows: Default::default(),
             selection_view: Default::default(),
@@ -858,6 +1044,7 @@ impl App {
             scroll_history: egui::util::History::new(2..16, 0.1),
             scroll_accum: egui::Vec2::ZERO,
             glide: None,
+            scroll_route: ScrollRoute::default(),
             scroll_last_event: None,
             page: Page::Chats,
             dialog: None,
@@ -867,6 +1054,8 @@ impl App {
             poll_voting: HashSet::new(),
             interactive_sending: HashSet::new(),
             contact_edit: None,
+            group_name_edit: None,
+            group_saving: HashSet::new(),
             new_contact_phone: String::new(),
             new_contact_name: String::new(),
             new_contact_last: String::new(),
@@ -907,6 +1096,7 @@ impl App {
             start_with_system: None,
             waker,
             tray: None,
+            tray_lockable,
             window_hidden: false,
             hide_intent: false,
             wants_show: false,
@@ -914,6 +1104,7 @@ impl App {
             notification_opens: Default::default(),
             notifications: Default::default(),
             badge: None,
+            app_lock,
         };
         // A hand-edited speed snaps to a supported one, so a speed control
         // always shows the speed that plays.
@@ -939,6 +1130,21 @@ impl App {
         self.wants_show = false;
     }
 
+    /// What the conversation shows behind its bubbles, for the chat and the
+    /// wallpaper preview alike.
+    pub fn wallpaper(&self) -> crate::wallpaper::Look {
+        crate::wallpaper::Look {
+            color: self.settings.wallpaper_background(&self.palette),
+            doodles: self.settings.show_wallpaper,
+            image: self
+                .settings
+                .wallpaper_image
+                .is_some()
+                .then(|| self.wallpaper_image.ready())
+                .flatten(),
+        }
+    }
+
     /// Whether window close keeps the app running without it.
     pub fn hides_to_tray(&self) -> bool {
         // macOS needs no status item: a Dock click reopens the window.
@@ -947,6 +1153,7 @@ impl App {
     }
 
     fn handle_tray(&mut self) {
+        self.sync_tray();
         let Some(events) = self.tray.as_ref().map(fastframe_tray::Tray::events) else {
             return;
         };
@@ -956,6 +1163,19 @@ impl App {
                 .into_iter()
                 .filter_map(|event| tray_action(event, hidden)),
         );
+    }
+
+    /// Offers "Lock ZapFast" in the tray exactly while an app lock password
+    /// is set, so setting or removing one changes the menu at once.
+    fn sync_tray(&mut self) {
+        let lockable = self.settings.app_lock_hash.is_some();
+        if lockable == self.tray_lockable {
+            return;
+        }
+        self.tray_lockable = lockable;
+        if let Some(tray) = &mut self.tray {
+            tray.set_visible(TRAY_LOCK, lockable);
+        }
     }
 
     fn handle_control_commands(&mut self) {
@@ -1011,6 +1231,10 @@ impl App {
         if reading {
             return;
         }
+        if self.app_lock.is_locked() {
+            self.notify_while_locked(chat_id, chat.is_group(), &message.id);
+            return;
+        }
         let (name, is_group) = (self.chat_title(chat), chat.is_group());
         let chat_sound = chat.notification_sound.clone();
         let sender = self.display_name_or(&message.sender, message.sender_name.as_deref());
@@ -1035,6 +1259,30 @@ impl App {
             crate::notify::NotificationTarget {
                 chat: chat_id.to_owned(),
                 message: message.id.clone(),
+            },
+            std::sync::Arc::clone(&self.notification_opens),
+            move || waker.wake(),
+        );
+    }
+
+    /// Announces a message while the app lock is on: "New message" from
+    /// ZapFast, without the chat, the sender, the text or a picture, so the
+    /// desktop shows nothing the lock screen hides. A chat's own sound and
+    /// the mention sound would tell who wrote, so only the message sound
+    /// plays, still silent for groups when group sounds are off. The click
+    /// target stays inside ZapFast: it opens the message once unlocked.
+    fn notify_while_locked(&mut self, chat_id: &str, is_group: bool, message: &str) {
+        let (title, body) = crate::notify::locked_lines(self.locale);
+        let sound = notification_sound(&self.settings, None, is_group, false);
+        let waker = self.waker.clone();
+        self.notifications.show(
+            title,
+            body,
+            None,
+            sound,
+            crate::notify::NotificationTarget {
+                chat: chat_id.to_owned(),
+                message: message.to_owned(),
             },
             std::sync::Arc::clone(&self.notification_opens),
             move || waker.wake(),
@@ -1088,6 +1336,10 @@ impl App {
         ctx.add_plugin(crate::ui::conversation::SelectionLeash::new(
             std::sync::Arc::clone(&self.selection_view),
         ));
+        // Colour emoji in labels, menus, tooltips and text fields; message
+        // bodies paint their own over placeholders, which it leaves alone.
+        ctx.add_plugin(crate::emoji::plugin());
+        crate::theme::set_font(ctx, self.settings.font);
         crate::theme::install(ctx);
         // Use a faster wheel speed for short chat rows.
         ctx.options_mut(|options| options.input_options.line_scroll_speed = 120.0);
@@ -1101,6 +1353,7 @@ impl App {
             .spawn(crate::emoji::warm_up)
             .ok();
         self.applied_dark = None;
+        self.theme_transition = fastframe_theme::Transition::default();
         self.zoom_applied = false;
         self.window_hidden = false;
         self.paste_before_release = false;
@@ -1444,8 +1697,16 @@ impl App {
             Content::Text { text, .. } | Content::Interactive { text, .. } => {
                 crate::markup::plain(text, &self.mention_list(message))
             }
-            _ => self.resolve_mention_tokens(&message.summary()),
+            _ => self.preview_line(&message.summary(), message),
         }
+    }
+
+    /// Plain text taken from `message` (a caption summary, a matched line)
+    /// with its mentions named as its body names them, including privacy-id
+    /// mentions the contact list cannot resolve on its own; any other
+    /// `@number` token of a known person is named too.
+    pub fn preview_line(&self, text: &str, message: &Message) -> String {
+        self.resolve_mention_tokens(&crate::markup::plain(text, &self.mention_list(message)))
     }
 
     /// Whether a direct chat uses a saved address-book name.
@@ -1528,8 +1789,17 @@ impl App {
             if name.starts_with('+') || name == "Unknown" {
                 numbers.push(name);
             } else {
+                // The saved first name, as WhatsApp shows here, whole: it can
+                // hold several words. Without one (a profile name, or a
+                // contact synced before first names were kept), the first
+                // word, so the line stays short.
+                let first = self.contacts.get(id).and_then(Contact::first_name);
                 let name = name.trim_start_matches('~');
-                names.push(name.split_whitespace().next().unwrap_or(name).to_owned());
+                names.push(
+                    first
+                        .unwrap_or_else(|| name.split_whitespace().next().unwrap_or(name))
+                        .to_owned(),
+                );
             }
         }
         names.sort_by_key(|name| name.to_lowercase());
@@ -1706,12 +1976,18 @@ impl App {
             .count()
     }
 
-    pub fn unread_total(&self) -> u32 {
-        self.chats
+    /// The taskbar count: unarchived, unmuted, unlocked chats that look
+    /// unread. WhatsApp counts chats here, not the messages inside them.
+    pub fn unread_chat_count(&self) -> u32 {
+        let now = crate::util::now();
+        let chats = self
+            .chats
             .iter()
-            .filter(|chat| !chat.archived && !chat.locked && !chat.muted(crate::util::now()))
-            .map(|chat| chat.unread)
-            .sum()
+            .filter(|chat| {
+                !chat.archived && !chat.locked && !chat.muted(now) && chat.looks_unread()
+            })
+            .count();
+        u32::try_from(chats).unwrap_or(u32::MAX)
     }
 
     /// Returns or requests a cached profile picture.
@@ -1767,6 +2043,17 @@ impl App {
         message.from_me
             && !matches!(message.content, Content::Revoked)
             && crate::util::now() - message.timestamp <= REVOKE_WINDOW.as_secs() as i64
+    }
+
+    /// A chat's unsent text on one line, for its row in the chat list. The
+    /// open chat's text is in the composer, where the reader sees it.
+    pub fn draft_preview(&self, chat: &str) -> Option<String> {
+        if self.open_chat.as_deref() == Some(chat) {
+            return None;
+        }
+        let draft = self.drafts.get(chat)?;
+        let line = draft.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!line.is_empty()).then_some(line)
     }
 
     /// Active typers in a chat as id and display name.
@@ -2142,6 +2429,16 @@ impl App {
                 Event::DownloadFolderPicked(path) => {
                     self.actions.push(Action::SetDownloadFolder(Some(path)));
                 }
+                Event::WallpaperImagePicked(Ok(path)) => {
+                    // The copy may keep the earlier one's name: decode it anew.
+                    self.wallpaper_image.reload();
+                    self.settings.wallpaper_image = Some(path);
+                    self.mark_settings_dirty();
+                }
+                Event::WallpaperImagePicked(Err(error)) => {
+                    let message = crate::i18n::gettext(self.locale, "Could not use this image");
+                    self.toast_error(format!("{message}: {error}"));
+                }
                 Event::NotificationSoundPicked { mention, path } => {
                     crate::notify::play_sound(crate::settings::NotificationSound::Custom(
                         path.clone(),
@@ -2267,6 +2564,13 @@ impl App {
                     unsent,
                     reason,
                 } => self.send_refused(chat, quoting, unsent, reason),
+                Event::GroupSaving { chat, saving } => {
+                    if saving {
+                        self.group_saving.insert(chat);
+                    } else {
+                        self.group_saving.remove(&chat);
+                    }
+                }
                 Event::Error(message) => {
                     self.sticker_import_pending = false;
                     self.new_contact_pending = false;
@@ -2316,6 +2620,9 @@ impl App {
                 self.draft_mentions.clear();
                 self.composer.clear();
                 self.composer_mentions.clear();
+                // The password guarded chats that are gone now; a forgotten
+                // one is recovered exactly this way.
+                self.forget_app_lock();
                 self.toast_error("This device was unlinked from your phone");
             }
             LinkStatus::Failed(message) => self.toast_error(message.clone()),
@@ -2937,6 +3244,14 @@ impl App {
         self.last_keystroke = None;
     }
 
+    /// Keeps following outgoing messages only when the reader was already at
+    /// the newest edge. Sending from older history must not lose their place.
+    fn follow_outgoing(&mut self) {
+        if self.at_bottom {
+            self.scroll_to_bottom = true;
+        }
+    }
+
     fn send_text(&mut self, chat: ChatId, text: String, quoting: Option<String>) {
         let text = text.trim().to_owned();
         if text.is_empty() {
@@ -2972,8 +3287,7 @@ impl App {
             quoting,
             mentions,
         });
-        self.scroll_to_bottom = true;
-        self.at_bottom = true;
+        self.follow_outgoing();
     }
 
     /// Replaces selected display-name mentions with WhatsApp's `@user`
@@ -3067,8 +3381,7 @@ impl App {
                 quoting: quoting.take(),
             });
         }
-        self.scroll_to_bottom = true;
-        self.at_bottom = true;
+        self.follow_outgoing();
     }
 
     #[allow(dead_code)]
@@ -3092,8 +3405,7 @@ impl App {
             mentions: Vec::new(),
             quoting: None,
         });
-        self.scroll_to_bottom = true;
-        self.at_bottom = true;
+        self.follow_outgoing();
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
@@ -3242,9 +3554,21 @@ impl App {
                 }
             },
         );
-        ctx.set_theme(preference);
-        // Use the same preference for our palette and egui's native controls.
-        let dark = ctx.theme() == egui::Theme::Dark;
+        if !self.zoom_applied {
+            ctx.set_zoom_factor(self.settings.zoom);
+            self.zoom_applied = true;
+        }
+        // Resolved here rather than after `set_theme`, so a change can keep the
+        // old colours, egui's own controls included, while it is revealed.
+        let dark = match preference {
+            egui::ThemePreference::Dark => true,
+            egui::ThemePreference::Light => false,
+            egui::ThemePreference::System => {
+                ctx.system_theme()
+                    .unwrap_or_else(|| ctx.options(|options| options.fallback_theme))
+                    == egui::Theme::Dark
+            }
+        };
         let palette = self.settings.cached_palette().unwrap_or_else(|| {
             if dark {
                 Palette::dark()
@@ -3255,14 +3579,21 @@ impl App {
         if crate::theme::apply_text_rendering_change(ctx) {
             self.applied_dark = None;
         }
+        // A change of colours after the window's first is revealed from the
+        // middle outwards, as Omarchy does; the old palette stays until the
+        // window's picture of it arrives.
+        if self.applied_dark.is_some() && self.palette != palette && self.reveal_theme_changes {
+            self.theme_transition.begin(ctx);
+            if self.theme_transition.holding(ctx) {
+                return;
+            }
+        }
+        // Use the same preference for our palette and egui's native controls.
+        ctx.set_theme(preference);
         if self.applied_dark.is_none() || self.palette != palette {
             self.palette = palette;
             crate::theme::apply(ctx, &self.palette);
             self.applied_dark = Some(dark);
-        }
-        if !self.zoom_applied {
-            ctx.set_zoom_factor(self.settings.zoom);
-            self.zoom_applied = true;
         }
     }
 
@@ -3277,6 +3608,14 @@ impl App {
     }
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
+        if self.app_lock.is_locked() && !allowed_while_locked(&action) {
+            // A clicked notification opens its message once unlocked; the
+            // rest would show or change what the lock hides.
+            if let Action::OpenMessage { chat, message } = action {
+                self.app_lock.deferred = Some(crate::notify::NotificationTarget { chat, message });
+            }
+            return;
+        }
         match action {
             Action::Open(page) => {
                 let opens_chats = page == Page::Chats;
@@ -3284,6 +3623,10 @@ impl App {
                 // announces it: read it again whenever Settings opens.
                 if page == Page::Settings && self.page != Page::Settings && self.is_connected() {
                     self.backend.send(Command::FetchAccountPrivacy);
+                }
+                // Typed passwords do not wait in a form nobody sees.
+                if page != Page::Settings && !self.app_lock.checking() {
+                    self.app_lock.form = None;
                 }
                 self.page = page;
                 self.dialog = None;
@@ -3418,8 +3761,7 @@ impl App {
                         button,
                         choice,
                     });
-                    self.scroll_to_bottom = true;
-                    self.at_bottom = true;
+                    self.follow_outgoing();
                 }
             }
             Action::CreatePoll { chat, draft } => {
@@ -3544,6 +3886,7 @@ impl App {
                     }
                 }
             }
+            Action::OpenLog(path) => self.backend.send(Command::OpenLog(path)),
             Action::SaveAttachmentAs { path, name } => {
                 self.backend
                     .send(Command::SaveAttachmentAs { source: path, name });
@@ -3623,31 +3966,47 @@ impl App {
                 let Some(conversation) = self.conversations.get(chat.as_str()) else {
                     return;
                 };
-                let position = |id: &str| {
-                    conversation
-                        .messages
-                        .iter()
-                        .position(|message| message.id == id)
-                };
                 let anchor = self.selection_anchor.clone().unwrap_or_else(|| id.clone());
-                if let (Some(from), Some(to)) = (position(&anchor), position(&id)) {
-                    let (from, to) = (from.min(to), from.max(to));
-                    for message in &conversation.messages[from..=to] {
-                        // Deleted and placeholder messages cannot be forwarded.
-                        if !matches!(
-                            message.content,
-                            Content::Revoked
-                                | Content::PhoneOnly { .. }
-                                | Content::Unsupported { .. }
-                        ) && !ids.contains(&message.id)
-                        {
-                            ids.push(message.id.clone());
-                        }
-                    }
-                    ids.sort_by_key(|id| position(id).unwrap_or(usize::MAX));
-                }
+                add_range(&conversation.messages, ids, &anchor, &id);
                 self.selection_anchor = Some(id);
             }
+            Action::SweepMessages { anchor, to } => {
+                let Some(chat) = self.open_chat.clone() else {
+                    return;
+                };
+                // A sweep adds to what was selected when it began, so
+                // dragging back leaves out the rows it passes again.
+                if self
+                    .sweep
+                    .as_ref()
+                    .is_none_or(|sweep| sweep.chat != chat || sweep.anchor != anchor)
+                {
+                    let base = self
+                        .selection
+                        .as_ref()
+                        .filter(|(selected, _)| *selected == chat)
+                        .map(|(_, ids)| ids.clone())
+                        .unwrap_or_default();
+                    self.sweep = Some(Sweep {
+                        chat: chat.clone(),
+                        anchor: anchor.clone(),
+                        to: to.clone(),
+                        base,
+                    });
+                }
+                let Some(sweep) = self.sweep.as_mut() else {
+                    return;
+                };
+                sweep.to.clone_from(&to);
+                let Some(conversation) = self.conversations.get(chat.as_str()) else {
+                    return;
+                };
+                let mut ids = sweep.base.clone();
+                add_range(&conversation.messages, &mut ids, &anchor, &to);
+                self.selection = (!ids.is_empty()).then_some((chat, ids));
+                self.selection_anchor = Some(to);
+            }
+            Action::EndSweep => self.sweep = None,
             Action::ToggleSelected(id) => {
                 self.selection_anchor = Some(id.clone());
                 if let Some((chat, ids)) = self.selection.as_mut() {
@@ -3672,7 +4031,10 @@ impl App {
                     }
                 }
             }
-            Action::CancelSelection => self.selection = None,
+            Action::CancelSelection => {
+                self.selection = None;
+                self.sweep = None;
+            }
             Action::Edit(id) => {
                 let text = self
                     .open_chat
@@ -3702,25 +4064,21 @@ impl App {
                     self.mention_start = None;
                 }
             }
-            Action::DeleteForEveryone(id) => {
-                if let Some(chat) = self.open_chat.clone() {
-                    if let Some(message) = self
-                        .conversations
-                        .get_mut(&chat)
-                        .and_then(|conversation| conversation.message_mut(&id))
-                    {
-                        message.content = Content::Revoked;
-                    }
-                    self.backend.send(Command::Revoke { chat, id });
+            Action::DeleteForEveryone { chat, id } => {
+                if let Some(message) = self
+                    .conversations
+                    .get_mut(&chat)
+                    .and_then(|conversation| conversation.message_mut(&id))
+                {
+                    message.content = Content::Revoked;
                 }
+                self.backend.send(Command::Revoke { chat, id });
             }
-            Action::DeleteForMe(id) => {
-                if let Some(chat) = self.open_chat.clone() {
-                    if let Some(conversation) = self.conversations.get_mut(&chat) {
-                        conversation.messages.retain(|message| message.id != id);
-                    }
-                    self.backend.send(Command::DeleteLocal { chat, id });
+            Action::DeleteForMe { chat, id } => {
+                if let Some(conversation) = self.conversations.get_mut(&chat) {
+                    conversation.messages.retain(|message| message.id != id);
                 }
+                self.backend.send(Command::DeleteLocal { chat, id });
             }
             Action::Attach => {
                 if let Some(chat) = self.open_chat.clone() {
@@ -3752,6 +4110,21 @@ impl App {
             }
             Action::SeekVideo { message, fraction } => self.video.seek(&message, fraction),
             Action::ToggleVideoSound => self.video.toggle_mute(),
+            Action::ExpandVideo { message, path } => {
+                if self.video.message() != Some(message.as_str()) {
+                    self.video.set_expanded(true);
+                    self.play_video(message, path);
+                }
+                if self.video.message().is_some() {
+                    self.video.set_expanded(true);
+                    self.video.resume();
+                    self.video_expanded = true;
+                }
+            }
+            Action::CollapseVideo => {
+                self.video_expanded = false;
+                self.video.set_expanded(false);
+            }
             Action::SeekVoice {
                 message,
                 path,
@@ -3824,6 +4197,12 @@ impl App {
                     self.picker = Some(tab);
                     self.picker_search.clear();
                     self.picker_focus = tab == PickerTab::Emoji;
+                    if tab == PickerTab::Emoji {
+                        crate::emoji::prewarm(
+                            ctx,
+                            crate::ui::picker::first_page(&self.settings.recent_emoji),
+                        );
+                    }
                     self.emoji_selected = 0;
                     self.emoji_jump = None;
                     if tab == PickerTab::Stickers {
@@ -3874,6 +4253,13 @@ impl App {
                     ctx.data(|data| data.get_temp::<egui::Rect>(id.with(anchor)));
                 self.reaction_beside_menu = beside_menu;
                 self.reaction_target = Some((chat, message));
+                let frequent: Vec<String> = self
+                    .settings
+                    .reaction_emoji
+                    .iter()
+                    .map(|(emoji, _)| emoji.clone())
+                    .collect();
+                crate::emoji::prewarm(ctx, crate::ui::picker::first_page(&frequent));
                 self.picker_search.clear();
                 self.picker_focus = true;
                 self.emoji_selected = 0;
@@ -4037,8 +4423,7 @@ impl App {
                         quoting,
                     });
                     self.picker = None;
-                    self.scroll_to_bottom = true;
-                    self.at_bottom = true;
+                    self.follow_outgoing();
                     self.refocus_composer(ctx);
                 }
             }
@@ -4057,8 +4442,7 @@ impl App {
                     let quoting = self.reply_to.take();
                     self.backend.send(Command::SendGif { chat, gif, quoting });
                     self.picker = None;
-                    self.scroll_to_bottom = true;
-                    self.at_bottom = true;
+                    self.follow_outgoing();
                     self.refocus_composer(ctx);
                 }
             }
@@ -4190,6 +4574,7 @@ impl App {
                     self.new_contact_pending = false;
                 }
                 self.contact_edit = None;
+                self.group_name_edit = None;
                 self.dialog = Some(dialog);
             }
             Action::CloseDialog => {
@@ -4198,6 +4583,7 @@ impl App {
                 self.invite = None;
                 self.forward_search.clear();
                 self.contact_edit = None;
+                self.group_name_edit = None;
                 self.refocus_composer(ctx);
             }
             Action::EditContact(prefill) => {
@@ -4405,6 +4791,7 @@ impl App {
             }
             Action::Search(text) => {
                 self.search = text;
+                self.search_selected = None;
                 let query = self.search.trim().to_owned();
                 // Editing the search away from the secret code hides the
                 // locked folder again, like leaving the phone's home screen.
@@ -4464,6 +4851,12 @@ impl App {
                 self.mark_settings_dirty();
                 self.apply_theme(ctx);
             }
+            Action::SetFont(choice) => {
+                self.settings.font = choice;
+                self.mark_settings_dirty();
+                crate::theme::set_font(ctx, choice);
+                ctx.request_repaint();
+            }
             Action::SetInterfaceLanguage(choice) => {
                 self.settings.interface_language = choice;
                 self.locale = crate::i18n::resolve(choice);
@@ -4488,6 +4881,14 @@ impl App {
             Action::SetWallpaperDoodles(show) => {
                 self.settings.show_wallpaper = show;
                 self.mark_settings_dirty();
+            }
+            Action::PickWallpaperImage => self.backend.send(Command::PickWallpaperImage),
+            Action::RemoveWallpaperImage => {
+                if self.settings.wallpaper_image.take().is_some() {
+                    self.mark_settings_dirty();
+                }
+                crate::wallpaper::forget_image(ctx);
+                self.backend.send(Command::RemoveWallpaperImage);
             }
             Action::ReloadThemes => self.load_custom_themes(),
             Action::OpenThemesFolder => {
@@ -4571,6 +4972,17 @@ impl App {
                 self.backend.send(Command::SetProfile { name, about });
             }
             Action::PickProfilePicture => self.backend.send(Command::PickProfilePicture),
+            Action::EditGroupName(name) => self.group_name_edit = Some(name),
+            Action::CloseGroupName => self.group_name_edit = None,
+            Action::SetGroupName { chat, name } => {
+                self.group_name_edit = None;
+                self.backend.send(Command::SetGroupName { chat, name });
+            }
+            Action::PickGroupPicture(chat) => self.backend.send(Command::PickGroupPicture(chat)),
+            Action::RemoveGroupPicture(chat) => {
+                self.backend
+                    .send(Command::SetGroupPicture { chat, jpeg: None });
+            }
             Action::SetChatSound { chat, sound } => {
                 if let Some(known) = self.chat_mut(&chat) {
                     known.notification_sound = sound.clone();
@@ -4626,6 +5038,63 @@ impl App {
             Action::Unlink => {
                 self.dialog = None;
                 self.backend.send(Command::Unlink);
+            }
+            Action::LockApp => self.lock_app(),
+            Action::UnlockApp => {
+                if let Some(stored) = self.settings.app_lock_hash.clone() {
+                    let waker = self.waker.clone();
+                    self.app_lock.try_unlock(&stored, move || waker.wake());
+                }
+            }
+            Action::ForgotAppPassword(open) => {
+                use crate::app_lock::Forgetting;
+                if self.app_lock.forgetting != Forgetting::Unlinking {
+                    self.app_lock.forgetting = if open {
+                        Forgetting::Confirming
+                    } else {
+                        Forgetting::No
+                    };
+                }
+            }
+            Action::UnlinkLockedApp => {
+                // The lock lifts only once WhatsApp has unlinked and the
+                // chats are gone (`LinkStatus::LoggedOut`), never before.
+                if self.app_lock.is_locked() {
+                    self.app_lock.forgetting = crate::app_lock::Forgetting::Unlinking;
+                    self.backend.send(Command::Unlink);
+                }
+            }
+            Action::AppLockForm(mode) => {
+                use crate::app_lock::{Form, FormMode};
+                // Setting a password must not replace one without it, and
+                // changing or removing one needs one to exist.
+                let fits = |mode: FormMode| {
+                    (mode == FormMode::Set) == self.settings.app_lock_hash.is_none()
+                };
+                if !self.app_lock.checking() {
+                    self.app_lock.form = mode.filter(|mode| fits(*mode)).map(Form::new);
+                }
+            }
+            Action::SubmitAppLockForm => {
+                use crate::app_lock::FormMode;
+                let stored = self.settings.app_lock_hash.clone();
+                let fits = self
+                    .app_lock
+                    .form
+                    .as_ref()
+                    .is_some_and(|form| (form.mode == FormMode::Set) == stored.is_none());
+                if fits {
+                    let waker = self.waker.clone();
+                    self.app_lock
+                        .submit_form(stored.as_deref(), move || waker.wake());
+                } else {
+                    self.app_lock.form = None;
+                }
+            }
+            Action::SetAutoLock(after) => {
+                self.settings.app_lock_after = after;
+                self.app_lock.note_input();
+                self.mark_settings_dirty();
             }
             Action::Reconnect => self.backend.send(Command::Reconnect),
             Action::StartOverArchive => {
@@ -4734,12 +5203,20 @@ impl App {
         if self.window_hidden || ctx.input(|input| input.viewport().focused) == Some(false) {
             self.window_focused = false;
         }
+        self.tick_app_lock(ctx);
+        // Nobody reads behind the lock screen: messages stay unread, the
+        // phone keeps notifying, and notifications here say nothing.
+        if self.app_lock.is_locked() {
+            self.window_focused = false;
+        }
         self.report_presence();
         self.handle_tray();
         #[cfg(target_os = "macos")]
         self.actions.extend(crate::macos::drain(self.window_hidden));
         self.handle_control_commands();
         self.poll_custom_themes();
+        self.wallpaper_image
+            .sync(self.settings.wallpaper_image.as_deref(), &self.waker);
         self.handle_notification_opens();
         self.handle_events();
         self.tick(ctx);
@@ -4751,16 +5228,134 @@ impl App {
         self.sync_badge();
     }
 
-    /// Mirrors the unread total onto the taskbar icon, where the desktop
+    /// Collects a finished password check, and locks once ZapFast has gone
+    /// unused for the chosen time. Inactivity counts while the window is
+    /// hidden too: only input in the window restarts it.
+    fn tick_app_lock(&mut self, ctx: &egui::Context) {
+        if let Some(outcome) = self.app_lock.poll() {
+            self.app_lock_outcome(outcome);
+        }
+        if self.settings.app_lock_hash.is_none() {
+            // Nothing to unlock with; never leave the window stuck.
+            if self.app_lock.is_locked() {
+                self.app_lock.release();
+            }
+            return;
+        }
+        if self.app_lock.is_locked() {
+            return;
+        }
+        // Recording a voice message is using ZapFast, keys or not.
+        if self.recording.is_some() {
+            self.app_lock.note_input();
+        }
+        let left = self
+            .app_lock
+            .idle_left(self.settings.app_lock_after.duration());
+        if left.is_zero() {
+            self.lock_app();
+        } else {
+            ctx.request_repaint_after(left);
+        }
+    }
+
+    /// Hides everything behind the lock screen. What was open stays open
+    /// for after the unlock, except what plays, records, or shows beyond the
+    /// window: media stops, a recording is discarded, the locked-chats folder
+    /// closes, and notifications already on the desktop are withdrawn.
+    pub fn lock_app(&mut self) {
+        if self.settings.app_lock_hash.is_none() || self.app_lock.is_locked() {
+            return;
+        }
+        self.app_lock.lock();
+        self.window_focused = false;
+        self.flush_open_draft();
+        self.recording = None;
+        self.player.stop();
+        self.video.stop();
+        self.voice_chat = None;
+        self.voice_wanted = None;
+        self.video_wanted = None;
+        self.dropping = false;
+        self.notifications.clear_all();
+        self.clear_chat_lock_entry();
+        if self.dialog == Some(Dialog::UnlockLockedChats) {
+            self.dialog = None;
+        }
+        if self.locked_folder || self.secret_code_matched() {
+            self.close_locked_folder();
+            self.search.clear();
+            self.search_hits.clear();
+        }
+        self.copy_rows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// Applies what the password thread worked out.
+    fn app_lock_outcome(&mut self, outcome: crate::app_lock::Outcome) {
+        use crate::app_lock::{FormError, Outcome};
+        match outcome {
+            Outcome::Unlock(matched) => {
+                if !self.app_lock.is_locked() {
+                    return;
+                }
+                self.app_lock.unlocked(matched);
+                if matched && let Some(target) = self.app_lock.deferred.take() {
+                    self.actions.push(Action::OpenMessage {
+                        chat: target.chat,
+                        message: target.message,
+                    });
+                }
+            }
+            Outcome::WrongCurrent => {
+                if let Some(form) = &mut self.app_lock.form {
+                    form.busy = false;
+                    form.error = Some(FormError::WrongCurrent);
+                }
+            }
+            Outcome::Set(verifier) => {
+                if self.app_lock.form.take().is_none() {
+                    return;
+                }
+                self.settings.app_lock_hash = Some(verifier);
+                self.app_lock.note_input();
+                self.save_settings();
+                self.toast(crate::i18n::gettext(self.locale, "App lock password saved"));
+            }
+            Outcome::TurnOff => {
+                if self.app_lock.form.take().is_none() {
+                    return;
+                }
+                self.settings.app_lock_hash = None;
+                self.save_settings();
+                self.toast(crate::i18n::gettext(self.locale, "App lock turned off"));
+            }
+        }
+    }
+
+    /// Forgets the app lock password and lifts the lock: after unlinking,
+    /// when nothing is left behind it.
+    fn forget_app_lock(&mut self) {
+        self.app_lock.form = None;
+        self.app_lock.deferred = None;
+        self.app_lock.release();
+        if self.settings.app_lock_hash.take().is_some() {
+            self.save_settings();
+        }
+    }
+
+    /// Mirrors the unread chat count onto the taskbar icon, where the desktop
     /// reads it. The badge ignores repeats, so calling this each frame is cheap.
     fn sync_badge(&mut self) {
-        let count = self.unread_total();
+        let count = self.unread_chat_count();
         if let Some(badge) = &mut self.badge {
             badge.set(count);
         }
     }
 
-    /// The unread total for the Windows taskbar overlay, which the window
+    /// The unread chat count for the Windows taskbar overlay, which the window
     /// applies itself; `None` in demo and test runs.
     #[cfg(target_os = "windows")]
     pub fn taskbar_badge_count(&self) -> Option<u32> {
@@ -4840,6 +5435,10 @@ impl App {
     fn tick_video(&mut self, ctx: &egui::Context) {
         if self.video.message().is_some() && self.video_chat != self.open_chat {
             self.video.stop();
+        }
+        if self.video_expanded && self.video.message().is_none() {
+            self.video_expanded = false;
+            self.video.set_expanded(false);
         }
         if let Some(crate::video::Notice::Unsupported(path)) = self.video.poll(ctx) {
             self.toast(crate::i18n::gettext(
@@ -4997,8 +5596,7 @@ impl App {
                     samples,
                     quoting,
                 });
-                self.scroll_to_bottom = true;
-                self.at_bottom = true;
+                self.follow_outgoing();
             }
             return;
         };
@@ -5031,7 +5629,13 @@ impl App {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
         self.apply_theme(ctx);
-        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        if ctx.input(|input| input.events.iter().any(is_user_input)) {
+            self.app_lock.note_input();
+        }
+        let locked = self.app_lock.is_locked();
+        // Behind the lock screen nobody is reading; unlocking counts as
+        // coming back to the window.
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true)) && !locked;
         let regained_focus = focused && !self.window_focused;
         // Mark messages received while hidden as read on window return.
         if regained_focus
@@ -5053,10 +5657,18 @@ impl App {
         {
             self.hide_intent = true;
         }
-        self.lock_scroll_axis(ctx);
-        self.take_drops_and_pastes(ctx);
+        if locked {
+            // Files dropped or pasted on the lock screen go nowhere.
+            self.dropping = false;
+        } else {
+            self.lock_scroll_axis(ctx);
+            self.route_scroll(ctx);
+            self.take_drops_and_pastes(ctx);
+        }
         crate::ui::show(self, ui);
         self.apply_actions(ctx);
+        // The old colours, if a change is being revealed, go over everything.
+        self.theme_transition.paint(ctx);
         // Release the image caches of everything that scrolled away.
         crate::image_cache::sweep(ctx);
         // Only fading info toasts animate. Errors wait for the reader.
@@ -5121,13 +5733,14 @@ impl App {
         if !dropped.is_empty() {
             self.actions.push(Action::SendFiles(dropped));
         }
-        self.take_image_paste(ctx, clipboard_image);
+        self.take_clipboard_paste(ctx, || clipboard_contents(clipboard_files, clipboard_image));
     }
 
-    fn take_image_paste(
+    /// Stages pasted files or a pasted picture for the open chat.
+    fn take_clipboard_paste(
         &mut self,
         ctx: &egui::Context,
-        read_image: impl FnOnce() -> Option<(usize, usize, Vec<u8>)>,
+        read_clipboard: impl FnOnce() -> Option<ClipboardPaste>,
     ) {
         let (paste, text, released, focused, command) = ctx.input(|input| {
             (
@@ -5157,7 +5770,7 @@ impl App {
             // A menu paste has no key release to wait for.
             self.paste_before_release = command;
         }
-        // Handle image paste only when the composer or no field has focus.
+        // Handle file and image paste only when the composer or no field has focus.
         let composing = ctx.memory(|memory| {
             memory.has_focus(egui::Id::new("composer-text")) || memory.focused().is_none()
         });
@@ -5171,19 +5784,27 @@ impl App {
                 .as_deref()
                 .and_then(|id| self.chat(id))
                 .is_some_and(Chat::can_send)
-            && let Some((width, height, rgba)) = read_image()
+            && let Some(contents) = read_clipboard()
         {
-            // A browser can offer both pixels and its source URL. Consume the
-            // text before the composer sees it, keeping any existing caption.
+            // A browser can offer both pixels and its source URL, and a file
+            // manager both paths and their text. Consume the text before the
+            // composer sees it, keeping any existing caption.
             ctx.input_mut(|input| {
                 input
                     .events
                     .retain(|event| !matches!(event, egui::Event::Paste(_)))
             });
-            self.actions.push(Action::PasteImage {
-                width,
-                height,
-                rgba,
+            self.actions.push(match contents {
+                ClipboardPaste::Files(paths) => Action::SendFiles(paths),
+                ClipboardPaste::Image {
+                    width,
+                    height,
+                    rgba,
+                } => Action::PasteImage {
+                    width,
+                    height,
+                    rgba,
+                },
             });
         }
     }
@@ -5212,7 +5833,7 @@ impl App {
                 && input.smooth_scroll_delta.y == 0.0;
             (sum, pointish && !remapped, ended)
         });
-        let now = Instant::now();
+        let now = ctx.input(|input| input.time);
         if raw != egui::Vec2::ZERO {
             self.scroll_from_trackpad = from_trackpad;
         }
@@ -5223,8 +5844,7 @@ impl App {
         if trackpad_here && raw != egui::Vec2::ZERO {
             self.glide = None;
             self.scroll_accum += raw * TRACKPAD_SCALE;
-            self.scroll_history
-                .add(ctx.input(|input| input.time), self.scroll_accum);
+            self.scroll_history.add(now, self.scroll_accum);
             self.scroll_last_event = Some(now);
             ctx.request_repaint_after(Duration::from_millis(60));
         } else if raw != egui::Vec2::ZERO || ctx.input(|input| input.pointer.any_down()) {
@@ -5232,9 +5852,15 @@ impl App {
             self.scroll_history.clear();
             self.scroll_last_event = None;
         }
-        let quiet = self
-            .scroll_last_event
-            .is_some_and(|at| now.duration_since(at).as_secs_f32() > 0.15);
+        // A pass that is redone (a discarded pass, such as the transcript's
+        // after rows above it were measured) gets no input events. That is
+        // not a pause in the gesture, even when the first pass took longer
+        // than the pause, and the frame's glide step was already taken.
+        let first_pass = ctx.current_pass_index() == 0;
+        let quiet = first_pass
+            && self
+                .scroll_last_event
+                .is_some_and(|at| now - at > SCROLL_GESTURE_GAP);
         if ended || quiet {
             let mut velocity = self.scroll_history.velocity().unwrap_or(egui::Vec2::ZERO);
             if let Some((axis, _)) = self.scroll_lock {
@@ -5249,7 +5875,7 @@ impl App {
             self.scroll_last_event = None;
         }
         if let Some(velocity) = self.glide {
-            if raw == egui::Vec2::ZERO {
+            if raw == egui::Vec2::ZERO && first_pass {
                 let dt = ctx.input(|input| input.stable_dt).clamp(0.001, 0.05);
                 ctx.input_mut(|input| input.smooth_scroll_delta += velocity * dt);
                 let slower = velocity * (-dt / GLIDE_DECAY).exp();
@@ -5267,7 +5893,7 @@ impl App {
         }
         let held = self
             .scroll_lock
-            .filter(|(_, at)| now.duration_since(*at) < SCROLL_GESTURE_GAP)
+            .filter(|(_, at)| now - *at < SCROLL_GESTURE_GAP)
             .map(|(axis, _)| axis);
         let moved = raw != egui::Vec2::ZERO;
         let axis = match held {
@@ -5286,6 +5912,25 @@ impl App {
             ScrollAxis::Horizontal => input.smooth_scroll_delta.y = 0.0,
             ScrollAxis::Vertical => input.smooth_scroll_delta.x = 0.0,
         });
+    }
+
+    /// Keeps this frame's scrolling with the pane its gesture began over,
+    /// after the axis lock and glide have had their say.
+    fn route_scroll(&mut self, ctx: &egui::Context) {
+        let (moved, lifted) = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .fold((false, false), |(moved, lifted), event| match event {
+                    egui::Event::MouseWheel { delta, phase, .. } => (
+                        moved || *delta != egui::Vec2::ZERO,
+                        lifted || matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel),
+                    ),
+                    _ => (moved, lifted),
+                })
+        });
+        let gliding = self.glide.is_some();
+        self.scroll_route.route(ctx, moved, lifted, gliding);
     }
 
     /// Whether the latest wheel input came in points (a trackpad), which the
@@ -5422,6 +6067,54 @@ pub fn wants_paste(input: &egui::InputState) -> bool {
     })
 }
 
+/// What a paste into the composer stages.
+#[derive(Debug)]
+enum ClipboardPaste {
+    /// Files copied in a file manager, staged like dropped files.
+    Files(Vec<PathBuf>),
+    /// Picture data as width, height, and straight-alpha RGBA.
+    Image {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    },
+}
+
+/// Prefers the clipboard's file list over its picture: Finder, Explorer and
+/// Linux file managers offer the file's icon as an image alongside the path,
+/// so a copied PDF or ZIP would otherwise arrive as its icon (#285).
+fn clipboard_contents(
+    read_files: impl FnOnce() -> Option<Vec<PathBuf>>,
+    read_image: impl FnOnce() -> Option<(usize, usize, Vec<u8>)>,
+) -> Option<ClipboardPaste> {
+    let files: Vec<PathBuf> = read_files()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            // text/uri-list lines end in CRLF, and arboard splits only on LF.
+            let path = match path.to_str() {
+                Some(text) if text.ends_with('\r') => PathBuf::from(text.trim_end_matches('\r')),
+                _ => path,
+            };
+            path.exists().then_some(path)
+        })
+        .collect();
+    if !files.is_empty() {
+        return Some(ClipboardPaste::Files(files));
+    }
+    read_image().map(|(width, height, rgba)| ClipboardPaste::Image {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Files copied to the clipboard by a file manager.
+fn clipboard_files() -> Option<Vec<PathBuf>> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get().file_list().ok()
+}
+
 /// Clipboard image as width, height, and straight-alpha RGBA.
 fn clipboard_image() -> Option<(usize, usize, Vec<u8>)> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
@@ -5487,6 +6180,51 @@ fn notification_sound(
     }
 }
 
+/// What may still happen while the app lock is on: the lock screen's own
+/// actions, the window and the tray, and settings results that show
+/// nothing. Everything else would show or change what the lock hides.
+fn allowed_while_locked(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::UnlockApp
+            | Action::LockApp
+            | Action::ForgotAppPassword(_)
+            | Action::UnlinkLockedApp
+            | Action::ShowWindow
+            | Action::HideWindow
+            | Action::CloseWindow
+            | Action::Quit
+            | Action::ReloadThemes
+            | Action::ZoomBy(_)
+            | Action::ResetZoom
+            | Action::SettingsChanged
+            | Action::SetChatSound { .. }
+            | Action::SetNotificationSound { .. }
+            | Action::SetDownloadFolder(_)
+    )
+}
+
+/// Whether an input event is someone using the window, which restarts the
+/// app lock's inactivity count. Focus changes and the pointer leaving are
+/// the desktop's doing, not the person's.
+fn is_user_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Paste(_)
+            | egui::Event::PointerMoved(_)
+            | egui::Event::MouseMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::Touch { .. }
+            | egui::Event::Ime(_)
+    )
+}
+
 fn notification_eligible(chat: &Chat, now: i64, message_at: i64) -> bool {
     if chat.archived || chat.unread == 0 || chat.muted(now) || chat.locked {
         return false;
@@ -5502,6 +6240,119 @@ mod tests {
     fn app() -> App {
         let root = std::env::temp_dir().join(format!("zapfast-app-{}", std::process::id()));
         App::headless(AppDirs::under(&root), Settings::default()).0
+    }
+
+    /// egui redoes a discarded pass without the frame's input events. However
+    /// long the first pass took, that is no pause in a trackpad gesture: the
+    /// redone pass must not end it and glide on top of the scroll.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_redone_pass_does_not_end_a_trackpad_gesture() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        for frame in 0..4 {
+            let events = (0..50)
+                .map(|_| egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 3.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                })
+                .collect();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    let redone = ctx.current_pass_index() > 0;
+                    if frame == 3 && !redone {
+                        ctx.request_discard("measured rows above the view");
+                    }
+                    if redone {
+                        // As if the first pass had taken a second.
+                        app.scroll_last_event = app.scroll_last_event.map(|at| at - 1.0);
+                    }
+                    app.lock_scroll_axis(&ctx);
+                    if redone {
+                        let delta = ctx.input(|input| input.smooth_scroll_delta.y);
+                        assert_eq!(delta, 0.0, "the redone pass scrolls again");
+                    }
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(app.glide.is_none(), "the gesture glides while it goes on");
+        assert!(app.scroll_last_event.is_some(), "the gesture goes on");
+    }
+
+    /// A trackpad gesture's pauses are measured on the frames' input clock.
+    /// A frame that is slow to draw is no pause: the gesture keeps its axis,
+    /// its pane, and its fingers on the pad. A pause in the input ends it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_trackpad_gesture_pauses_on_the_input_clock() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let run = |app: &mut App, time: f64, delta: egui::Vec2| {
+            let events = if delta == egui::Vec2::ZERO {
+                Vec::new()
+            } else {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta,
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                }]
+            };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.lock_scroll_axis(&ctx);
+                    app.route_scroll(&ctx);
+                },
+            );
+            output.textures_delta.clear();
+        };
+        for frame in 0..6 {
+            run(&mut app, f64::from(frame) / 60.0, egui::vec2(0.0, 30.0));
+        }
+        app.scroll_route.owner = Some(ScrollPane::Messages);
+        // A frame that takes a quarter of a second to draw, 16 ms of input
+        // time after the last: nothing about the gesture has changed.
+        std::thread::sleep(Duration::from_millis(250));
+        run(&mut app, 6.0 / 60.0, egui::Vec2::ZERO);
+        assert!(app.glide.is_none(), "a slow frame lets the gesture glide");
+        assert!(
+            app.scroll_last_event.is_some(),
+            "a slow frame ends the gesture"
+        );
+        assert_eq!(
+            app.scroll_route.owner,
+            Some(ScrollPane::Messages),
+            "a slow frame lets go of the gesture's pane"
+        );
+        // Sideways input just after keeps the vertical axis.
+        run(&mut app, 7.0 / 60.0, egui::vec2(30.0, 0.0));
+        let held = app.scroll_lock.map(|(axis, _)| axis);
+        assert_eq!(held, Some(ScrollAxis::Vertical), "the axis is held");
+        // A pause in the input itself ends the gesture, which glides.
+        run(&mut app, 7.0 / 60.0 + 0.2, egui::Vec2::ZERO);
+        assert!(
+            app.scroll_last_event.is_none(),
+            "the pause ends the gesture"
+        );
+        assert!(app.glide.is_some(), "the lifted gesture glides");
+        run(&mut app, 2.0, egui::Vec2::ZERO);
+        run(&mut app, 3.0, egui::vec2(30.0, 0.0));
+        let held = app.scroll_lock.map(|(axis, _)| axis);
+        assert_eq!(held, Some(ScrollAxis::Horizontal), "a new gesture picks");
     }
 
     /// A chat that is gone or emptied takes its confirmation with it: a modal
@@ -5713,10 +6564,23 @@ mod tests {
     fn clipboard_frame(
         app: &mut App,
         ctx: &egui::Context,
-        mut events: Vec<egui::Event>,
+        events: Vec<egui::Event>,
         image: bool,
     ) -> usize {
+        clipboard_frame_with_files(app, ctx, events, None, image).0
+    }
+
+    /// Runs a frame whose clipboard holds `files` and, if `image`, a picture.
+    /// Returns how often the clipboard and its picture were read.
+    fn clipboard_frame_with_files(
+        app: &mut App,
+        ctx: &egui::Context,
+        mut events: Vec<egui::Event>,
+        files: Option<Vec<PathBuf>>,
+        image: bool,
+    ) -> (usize, usize) {
         let mut reads = 0;
+        let mut image_reads = 0;
         events.insert(0, egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -5724,9 +6588,15 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                app.take_image_paste(ui.ctx(), || {
+                app.take_clipboard_paste(ui.ctx(), || {
                     reads += 1;
-                    image.then(|| (2, 2, vec![200; 16]))
+                    clipboard_contents(
+                        || files.clone(),
+                        || {
+                            image_reads += 1;
+                            image.then(|| (2, 2, vec![200; 16]))
+                        },
+                    )
                 });
                 ui.add(
                     egui::TextEdit::singleline(&mut app.composer)
@@ -5736,7 +6606,7 @@ mod tests {
             },
         );
         output.textures_delta.clear();
-        reads
+        (reads, image_reads)
     }
 
     fn clipboard_app() -> (App, egui::Context) {
@@ -5791,7 +6661,13 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                app.take_image_paste(ui.ctx(), || Some((2, 2, vec![200; 16])));
+                app.take_clipboard_paste(ui.ctx(), || {
+                    Some(ClipboardPaste::Image {
+                        width: 2,
+                        height: 2,
+                        rgba: vec![200; 16],
+                    })
+                });
                 app.apply_actions(ui.ctx());
             },
         );
@@ -5836,6 +6712,57 @@ mod tests {
             "a clipboard change before release must not stage an unrelated image"
         );
         assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn a_copied_file_stages_the_file_and_not_its_icon() {
+        let directory = tempfile::tempdir().unwrap();
+        let pdf = directory.path().join("fixture.pdf");
+        let zip = directory.path().join("fixture archive.zip");
+        std::fs::write(&pdf, b"%PDF-fixture").unwrap();
+        std::fs::write(&zip, b"PK-fixture").unwrap();
+        let (mut app, ctx) = clipboard_app();
+        // Finder offers the path, the file name as text, and an icon picture.
+        let (reads, image_reads) = clipboard_frame_with_files(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Paste("fixture.pdf".into()), paste_release()],
+            Some(vec![pdf.clone(), zip.clone()]),
+            true,
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(image_reads, 0, "the icon picture is never read");
+        assert!(matches!(
+            app.pending.as_slice(),
+            [Pending::File(first), Pending::File(second)] if *first == pdf && *second == zip
+        ));
+        assert_eq!(app.composer, "caption", "the file name is not pasted");
+    }
+
+    #[test]
+    fn a_uri_list_line_ending_does_not_hide_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("fixture.zip");
+        std::fs::write(&file, b"PK-fixture").unwrap();
+        let mut listed = file.clone().into_os_string();
+        listed.push("\r");
+        let contents = clipboard_contents(|| Some(vec![PathBuf::from(listed)]), || None);
+        assert!(matches!(contents, Some(ClipboardPaste::Files(paths)) if paths == [file]));
+    }
+
+    #[test]
+    fn a_missing_copied_file_falls_back_to_the_picture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, ctx) = clipboard_app();
+        let (_, image_reads) = clipboard_frame_with_files(
+            &mut app,
+            &ctx,
+            vec![paste_release()],
+            Some(vec![directory.path().join("gone.pdf")]),
+            true,
+        );
+        assert_eq!(image_reads, 1);
+        assert!(matches!(app.pending.as_slice(), [Pending::Picture { .. }]));
     }
 
     #[test]
@@ -6479,15 +7406,36 @@ mod tests {
             Some(Action::Quit)
         ));
         assert!(super::tray_action(Event::Menu("other"), false).is_none());
-        let menu = super::tray_config().menu;
-        assert_eq!(
-            menu,
-            [
-                fastframe_tray::MenuItem::action(super::TRAY_SHOW, "Show or hide ZapFast"),
-                fastframe_tray::MenuItem::Separator,
-                fastframe_tray::MenuItem::action(super::TRAY_QUIT, "Quit"),
-            ]
-        );
+        assert!(matches!(
+            super::tray_action(Event::Menu(super::TRAY_LOCK), false),
+            Some(Action::LockApp)
+        ));
+        for lockable in [false, true] {
+            assert_eq!(
+                super::tray_config(lockable).menu,
+                [
+                    fastframe_tray::MenuItem::action(super::TRAY_SHOW, "Show or hide ZapFast"),
+                    fastframe_tray::MenuItem::action(super::TRAY_LOCK, "Lock ZapFast")
+                        .visible(lockable),
+                    fastframe_tray::MenuItem::Separator,
+                    fastframe_tray::MenuItem::action(super::TRAY_QUIT, "Quit"),
+                ]
+            );
+        }
+    }
+
+    /// The tray offers "Lock ZapFast" as soon as a password is set and stops
+    /// as soon as it is removed, not at the next start.
+    #[test]
+    fn the_tray_offers_the_lock_while_a_password_is_set() {
+        let mut app = app();
+        assert!(!app.tray_lockable);
+        app.settings.app_lock_hash = Some(crate::app_lock::verifier("secret"));
+        app.handle_tray();
+        assert!(app.tray_lockable);
+        app.settings.app_lock_hash = None;
+        app.handle_tray();
+        assert!(!app.tray_lockable);
     }
 
     #[test]
@@ -6521,6 +7469,50 @@ mod tests {
         assert_eq!(app.palette.accent, egui::Color32::GREEN);
         app.apply(Action::SetTheme(ThemeChoice::Light), &ctx);
         assert_eq!(app.palette, Palette::light());
+    }
+
+    /// A change of colours keeps the old palette while the window's picture
+    /// of it is on its way, and applies the new one once it arrives or after
+    /// a short wait without it. The window's first palette is not revealed.
+    #[test]
+    fn a_theme_change_holds_the_old_colours_until_its_reveal_can_start() {
+        let mut app = app();
+        app.reveal_theme_changes = true;
+        app.settings.theme = ThemeChoice::Dark;
+        app.settings.custom_theme = None;
+        let ctx = egui::Context::default();
+        let at = |app: &mut App, time: f64| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| app.apply_theme(ui.ctx()),
+            );
+            output.textures_delta.clear();
+        };
+        at(&mut app, 0.0);
+        assert_eq!(
+            app.palette,
+            Palette::dark(),
+            "the first palette applies at once"
+        );
+
+        app.settings.theme = ThemeChoice::Light;
+        at(&mut app, 1.0);
+        assert_eq!(
+            app.palette,
+            Palette::dark(),
+            "held for the window's picture"
+        );
+        at(&mut app, 1.1);
+        assert_eq!(app.palette, Palette::dark());
+        at(&mut app, 1.5);
+        assert_eq!(
+            app.palette,
+            Palette::light(),
+            "no picture came: applied anyway"
+        );
     }
 
     #[test]
@@ -6753,6 +7745,73 @@ mod tests {
         app.apply(Action::SelectMessage("second".into()), &ctx);
         app.apply(Action::ToggleSelected("second".into()), &ctx);
         assert!(app.selection.is_none());
+    }
+
+    /// #246: a sweep adds its range to what was selected when it began, in
+    /// the chat's order, and shrinks again when dragged back.
+    #[test]
+    fn a_sweep_adds_its_range_to_the_selection_it_began_from() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let chat = "1@s.whatsapp.net";
+        app.chats = vec![Chat::new(chat.into(), "Ada".into())];
+        app.open_chat = Some(chat.into());
+        let mut gone = message(chat, "gone", 3);
+        gone.content = Content::Revoked;
+        app.conversations.entry(chat.into()).or_default().merge(
+            vec![
+                message(chat, "first", 1),
+                message(chat, "second", 2),
+                gone,
+                message(chat, "fourth", 4),
+                message(chat, "fifth", 5),
+            ],
+            false,
+        );
+        let selected = |app: &App| app.selection.as_ref().map(|(_, ids)| ids.clone());
+        let sweep = |app: &mut App, to: &str| {
+            app.apply(
+                Action::SweepMessages {
+                    anchor: "fifth".into(),
+                    to: to.into(),
+                },
+                &ctx,
+            );
+        };
+        // Outside a selection, a sweep starts one.
+        sweep(&mut app, "fifth");
+        assert_eq!(selected(&app), Some(vec!["fifth".into()]));
+        sweep(&mut app, "second");
+        assert_eq!(
+            selected(&app),
+            Some(vec!["second".into(), "fourth".into(), "fifth".into()]),
+            "what cannot be forwarded stays out"
+        );
+        sweep(&mut app, "fourth");
+        assert_eq!(selected(&app), Some(vec!["fourth".into(), "fifth".into()]));
+        app.apply(Action::EndSweep, &ctx);
+        assert!(app.sweep.is_none());
+        // A new sweep keeps what was selected before it.
+        app.apply(Action::ToggleSelected("first".into()), &ctx);
+        app.apply(
+            Action::SweepMessages {
+                anchor: "second".into(),
+                to: "second".into(),
+            },
+            &ctx,
+        );
+        assert_eq!(
+            selected(&app),
+            Some(vec![
+                "first".into(),
+                "second".into(),
+                "fourth".into(),
+                "fifth".into()
+            ])
+        );
+        // Escape ends both.
+        app.apply(Action::CancelSelection, &ctx);
+        assert!(app.selection.is_none() && app.sweep.is_none());
     }
 
     #[test]
@@ -7608,6 +8667,72 @@ mod tests {
         assert!(app.video.message().is_none());
     }
 
+    /// Choosing a font saves the choice and installs it at once.
+    #[test]
+    fn choosing_a_font_saves_and_applies_it() {
+        use crate::settings::FontChoice;
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        assert_eq!(app.settings.font, FontChoice::System);
+        app.apply(Action::SetFont(FontChoice::Inter), &ctx);
+        assert_eq!(app.settings.font, FontChoice::Inter);
+        assert!(crate::theme::inter_chosen());
+        app.apply(Action::SetFont(FontChoice::System), &ctx);
+        assert_eq!(app.settings.font, FontChoice::System);
+        assert!(!crate::theme::inter_chosen());
+    }
+
+    /// A video opens over the window at a size worth the room, goes back to
+    /// its message at the bubble's, and does not outlive the chat.
+    #[test]
+    fn a_video_covers_the_window_and_goes_back_to_its_message() {
+        let mut app = app();
+        app.video.silence();
+        let chat = "fixture@s.whatsapp.net";
+        app.open_chat = Some(chat.into());
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/video/sample.mp4"
+        ));
+        let bubble = app.video.side();
+        let expand = || Action::ExpandVideo {
+            message: "clip".into(),
+            path: path.clone(),
+        };
+
+        // Not loaded yet: it starts, already at the larger size.
+        app.apply(expand(), &ctx);
+        assert_eq!(app.video.message(), Some("clip"));
+        assert!(app.video_expanded && app.video.is_active());
+        assert!(app.video.side() > bubble);
+
+        app.apply(Action::CollapseVideo, &ctx);
+        assert!(!app.video_expanded);
+        assert_eq!(app.video.side(), bubble);
+        assert_eq!(app.video.message(), Some("clip"), "it stays loaded");
+
+        // Paused in its bubble, expanding it plays it.
+        app.apply(
+            Action::PlayVideo {
+                message: "clip".into(),
+                path: path.clone(),
+            },
+            &ctx,
+        );
+        assert!(!app.video.is_active());
+        app.apply(expand(), &ctx);
+        assert!(app.video_expanded && app.video.is_active());
+
+        // Leaving the chat stops the video and takes the view down with it.
+        app.open_chat = None;
+        app.tick_video(&ctx);
+        assert!(app.video.message().is_none());
+        assert!(!app.video_expanded);
+        assert_eq!(app.video.side(), bubble);
+    }
+
     #[test]
     fn repeated_download_clicks_do_not_queue_more_requests() {
         let mut app = app();
@@ -7830,6 +8955,52 @@ mod tests {
         app.handle_events();
         assert_eq!(app.composer, "Newer draft");
         assert!(error_toasts(&app)[1].contains("not connected"));
+    }
+
+    #[test]
+    fn sending_a_reply_keeps_older_messages_in_view() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "fixture@s.whatsapp.net";
+        app.open_chat = Some(chat.into());
+        app.at_bottom = false;
+        app.scroll_to_bottom = false;
+
+        app.apply(
+            Action::SendText {
+                chat: chat.into(),
+                text: "Reply fixture".into(),
+                quoting: Some("older-message".into()),
+            },
+            &egui::Context::default(),
+        );
+
+        assert!(!app.scroll_to_bottom, "the older position stays selected");
+        assert!(!app.at_bottom, "sending does not pretend the view moved");
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(
+                command,
+                Command::SendText { quoting: Some(id), .. } if id == "older-message"
+            ))
+        );
+
+        app.at_bottom = true;
+        app.scroll_to_bottom = false;
+        app.apply(
+            Action::SendText {
+                chat: chat.into(),
+                text: "Latest fixture".into(),
+                quoting: None,
+            },
+            &egui::Context::default(),
+        );
+
+        assert!(
+            app.scroll_to_bottom,
+            "a reader at the newest edge keeps following outgoing messages"
+        );
+        assert!(app.at_bottom);
     }
 
     #[test]
@@ -8371,6 +9542,7 @@ mod tests {
         let contact = |id: &str, name: &str| crate::model::Contact {
             id: id.into(),
             full_name: Some(name.into()),
+            first_name: None,
             push_name: None,
         };
         // Exclude contacts that already have chats.
@@ -8446,8 +9618,26 @@ mod tests {
             .map(|chat| chat.name.as_str())
             .collect();
         assert_eq!(shown, ["Ada"], "the chip finds the chat marked by hand");
-        // Nothing is pending, so the app badge stays at zero.
-        assert_eq!(app.unread_total(), 0);
+        // The app badge counts it too, as WhatsApp does.
+        assert_eq!(app.unread_chat_count(), 1);
+    }
+
+    #[test]
+    fn the_app_badge_counts_unread_chats_not_messages() {
+        let mut app = app();
+        let mut busy = Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        busy.unread = 7;
+        let mut quiet = Chat::new("2@s.whatsapp.net".into(), "Grace".into());
+        quiet.unread = 1;
+        let mut archived = Chat::new("3@s.whatsapp.net".into(), "Old".into());
+        archived.archived = true;
+        archived.unread = 4;
+        let mut muted = Chat::new("4@s.whatsapp.net".into(), "Loud".into());
+        muted.muted_until = Some(i64::MAX);
+        muted.unread = 9;
+        let read = Chat::new("5@s.whatsapp.net".into(), "Done".into());
+        app.chats = vec![busy, quiet, archived, muted, read];
+        assert_eq!(app.unread_chat_count(), 2);
     }
 
     #[test]
@@ -8854,7 +10044,7 @@ mod tests {
         assert_eq!(names, vec!["Ada"]);
         app.search = "bob".into();
         assert!(app.visible_chats().is_empty());
-        assert_eq!(app.unread_total(), 3);
+        assert_eq!(app.unread_chat_count(), 1);
         assert_eq!(app.unread_chats(ChatFilter::All), 1);
 
         // Typing the code reveals the entry; opening the folder shows only
@@ -9017,6 +10207,7 @@ mod tests {
         let contact = Contact {
             id: "2@s.whatsapp.net".into(),
             full_name: Some("A\u{301}ngel".into()),
+            first_name: None,
             push_name: None,
         };
         app.contacts.insert(contact.id.clone(), contact);
@@ -9184,6 +10375,67 @@ mod tests {
         assert!(app.focus_composer);
     }
 
+    /// Plain egui text (a label, a tooltip) gets its emoji in colour from
+    /// the plugin, while a line laid out with placeholders gets exactly one
+    /// picture, its own, and no second one from the plugin.
+    #[test]
+    fn plain_text_emoji_are_coloured_without_painting_placeholders_twice() {
+        use egui::epaint::{Shape, TextureId};
+        fn pictures(shape: &Shape) -> usize {
+            match shape {
+                Shape::Vec(shapes) => shapes.iter().map(pictures).sum(),
+                Shape::Mesh(mesh) if mesh.texture_id != TextureId::default() => 1,
+                _ => 0,
+            }
+        }
+        assert!(
+            crate::emoji::available(),
+            "the bundled font is always there"
+        );
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let count = |draw: &dyn Fn(&mut egui::Ui)| {
+            let mut total = 0;
+            // A new area is measured in its first frame and drawn after.
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| draw(ui));
+                output.textures_delta.clear();
+                total = output
+                    .shapes
+                    .iter()
+                    .map(|clipped| pictures(&clipped.shape))
+                    .sum::<usize>();
+            }
+            total
+        };
+        assert_eq!(count(&|ui| drop(ui.label("plain 😀"))), 1, "a label");
+        assert_eq!(
+            count(&|ui| {
+                egui::Area::new(egui::Id::new("tip"))
+                    .order(egui::Order::Tooltip)
+                    .show(ui.ctx(), |ui| ui.label("tip 👍🏽"));
+            }),
+            1,
+            "a tooltip"
+        );
+        assert_eq!(
+            count(&|ui| {
+                let line = crate::ui::widgets::line(
+                    ui,
+                    "placeholder 😀",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                    300.0,
+                    1,
+                );
+                line.paint(ui, egui::pos2(0.0, 0.0), egui::Color32::WHITE);
+            }),
+            1,
+            "a placeholder line"
+        );
+    }
+
     #[test]
     fn returning_to_a_conversation_does_not_interrupt_search() {
         let mut app = app();
@@ -9211,6 +10463,7 @@ mod tests {
             Contact {
                 id: "1@s.whatsapp.net".into(),
                 full_name: Some("Ada".into()),
+                first_name: None,
                 push_name: None,
             },
         );
@@ -9225,6 +10478,7 @@ mod tests {
             Contact {
                 id: "42@lid".into(),
                 full_name: None,
+                first_name: None,
                 push_name: Some("Bob".into()),
             },
         );
@@ -9249,6 +10503,7 @@ mod name_tests {
             Contact {
                 id: "1@s.whatsapp.net".into(),
                 full_name: Some("Ada Lovelace".into()),
+                first_name: None,
                 push_name: Some("Ada".into()),
             },
         );
@@ -9257,10 +10512,43 @@ mod name_tests {
             Contact {
                 id: "2@s.whatsapp.net".into(),
                 full_name: None,
+                first_name: None,
                 push_name: Some("Bob".into()),
             },
         );
         app
+    }
+
+    #[test]
+    fn group_members_go_by_their_whole_saved_first_name() {
+        let mut app = app();
+        let mut chat = Chat::new("fixture@g.us".into(), "Group".into());
+        for (index, full_name, first_name) in [
+            (0, "My Dih", Some("My Dih")),
+            (1, "Grace Hopper", Some("Grace")),
+            (2, "Mary Ann Evans", None),
+            (3, "Stray Name", Some("")),
+        ] {
+            let id = format!("1555000001{index}@s.whatsapp.net");
+            app.contacts.insert(
+                id.clone(),
+                Contact {
+                    id: id.clone(),
+                    full_name: Some(full_name.into()),
+                    first_name: first_name.map(Into::into),
+                    push_name: None,
+                },
+            );
+            chat.participants.push(id);
+        }
+        // Without a saved first name (a profile name, or a contact synced
+        // before first names were kept) the line keeps the first word.
+        chat.participants.push("2@s.whatsapp.net".into());
+        app.contacts.get_mut("2@s.whatsapp.net").unwrap().push_name = Some("Bob Builder".into());
+        assert_eq!(
+            app.participant_names(&chat),
+            "Bob, Grace, Mary, My Dih, Stray"
+        );
     }
 
     #[test]
@@ -9282,6 +10570,7 @@ mod name_tests {
                 Contact {
                     id: id.clone(),
                     full_name: Some((*name).into()),
+                    first_name: name.split(' ').next().map(Into::into),
                     push_name: Some((*name).into()),
                 },
             );
@@ -9356,5 +10645,389 @@ mod name_tests {
             thumbnail: None,
         };
         assert_eq!(app.message_text(&message), "ciao @Carmine");
+
+        // A caption mentioning a privacy id is named through the message's
+        // mentions, which carry the canonical id, in notifications and
+        // search results alike.
+        let photo = Message {
+            content: Content::Image {
+                caption: Some("@987654321012345 looks sharp".into()),
+                media: Media {
+                    mime: "image/jpeg".into(),
+                    size: 100,
+                    width: None,
+                    height: None,
+                    path: None,
+                    state: MediaState::Idle,
+                },
+            },
+            mentions: vec![MentionRef {
+                user: "987654321012345".into(),
+                id: "15550001111@s.whatsapp.net".into(),
+            }],
+            ..message
+        };
+        assert_eq!(app.message_text(&photo), "Photo: @Carmine looks sharp");
+        assert_eq!(
+            app.preview_line("@987654321012345 looks sharp", &photo),
+            "@Carmine looks sharp"
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_lock_tests {
+    use super::*;
+    use crate::app_lock::{Clock, Form, FormError, FormMode};
+    use std::sync::{Arc, Mutex};
+
+    const PASSWORD: &str = "open-sesame";
+    const CHAT: &str = "1@s.whatsapp.net";
+
+    fn settings(password: Option<&str>) -> Settings {
+        Settings {
+            app_lock_hash: password.map(crate::app_lock::verifier),
+            ..Settings::default()
+        }
+    }
+
+    fn app_with(settings: Settings) -> App {
+        let root = std::env::temp_dir().join(format!(
+            "zapfast-app-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        App::headless(AppDirs::under(&root), settings).0
+    }
+
+    /// An app with the lock set but not locked, as after unlocking.
+    fn unlocked_app() -> App {
+        let mut app = app_with(settings(Some(PASSWORD)));
+        app.app_lock.release();
+        app
+    }
+
+    fn manual_clock(app: &mut App) -> Arc<Mutex<Instant>> {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let read = Arc::clone(&now);
+        let clock: Clock = Arc::new(move || *read.lock().unwrap());
+        app.app_lock.set_clock(clock);
+        now
+    }
+
+    fn advance(now: &Mutex<Instant>, by: Duration) {
+        *now.lock().unwrap() += by;
+    }
+
+    /// Waits for the password thread and applies its answer.
+    fn finish(app: &mut App, ctx: &egui::Context) {
+        let outcome = app.app_lock.wait().expect("a finished check");
+        app.app_lock_outcome(outcome);
+        app.apply_actions(ctx);
+    }
+
+    fn try_password(app: &mut App, ctx: &egui::Context, password: &str) {
+        app.app_lock.entry = password.into();
+        app.apply(Action::UnlockApp, ctx);
+        finish(app, ctx);
+    }
+
+    fn incoming(app: &mut App) -> Message {
+        let mut chat = Chat::new(CHAT.into(), "Ada Lovelace".into());
+        chat.unread = 1;
+        app.chats = vec![chat];
+        Message {
+            id: "m1".into(),
+            chat: CHAT.into(),
+            sender: CHAT.into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: crate::util::now(),
+            content: Content::text("the engine is ready"),
+            status: Delivery::None,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        }
+    }
+
+    #[test]
+    fn it_starts_locked_only_with_a_password() {
+        assert!(app_with(settings(Some(PASSWORD))).app_lock.is_locked());
+        assert!(!app_with(settings(None)).app_lock.is_locked());
+    }
+
+    #[test]
+    fn inactivity_locks_after_the_chosen_time_even_while_hidden() {
+        let ctx = egui::Context::default();
+        let mut app = unlocked_app();
+        app.settings.app_lock_after = crate::settings::AutoLock::OneMinute;
+        let now = manual_clock(&mut app);
+        advance(&now, Duration::from_secs(59));
+        app.background_frame(&ctx);
+        assert!(!app.app_lock.is_locked());
+        // Input restarts the count.
+        app.app_lock.note_input();
+        advance(&now, Duration::from_secs(59));
+        app.background_frame(&ctx);
+        assert!(!app.app_lock.is_locked());
+        // Hidden in the tray, only the headless loop runs, and it locks.
+        app.window_gone();
+        advance(&now, Duration::from_secs(2));
+        app.background_frame(&ctx);
+        assert!(app.app_lock.is_locked());
+    }
+
+    #[test]
+    fn a_longer_choice_waits_longer_and_no_password_never_locks() {
+        let ctx = egui::Context::default();
+        let mut app = unlocked_app();
+        app.apply(
+            Action::SetAutoLock(crate::settings::AutoLock::OneHour),
+            &ctx,
+        );
+        let now = manual_clock(&mut app);
+        advance(&now, Duration::from_secs(59 * 60));
+        app.background_frame(&ctx);
+        assert!(!app.app_lock.is_locked());
+        advance(&now, Duration::from_secs(60));
+        app.background_frame(&ctx);
+        assert!(app.app_lock.is_locked());
+
+        let mut app = app_with(settings(None));
+        let now = manual_clock(&mut app);
+        advance(&now, Duration::from_secs(24 * 60 * 60));
+        app.background_frame(&ctx);
+        app.apply(Action::LockApp, &ctx);
+        assert!(!app.app_lock.is_locked());
+    }
+
+    #[test]
+    fn window_input_counts_as_use() {
+        let ctx = egui::Context::default();
+        let mut app = unlocked_app();
+        app.settings.app_lock_after = crate::settings::AutoLock::OneMinute;
+        app.attach(&ctx);
+        let now = manual_clock(&mut app);
+        advance(&now, Duration::from_secs(50));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(egui::pos2(10.0, 10.0))],
+                ..Default::default()
+            },
+            |ui| app.frame_ui(ui),
+        );
+        output.textures_delta.clear();
+        advance(&now, Duration::from_secs(50));
+        app.background_frame(&ctx);
+        assert!(!app.app_lock.is_locked());
+    }
+
+    #[test]
+    fn lock_now_stops_media_and_closes_the_locked_folder() {
+        let ctx = egui::Context::default();
+        let mut app = unlocked_app();
+        app.locked_folder = true;
+        app.chat_lock_entry = "half typed".into();
+        app.window_focused = true;
+        app.apply(Action::LockApp, &ctx);
+        assert!(app.app_lock.is_locked());
+        assert!(!app.locked_folder);
+        assert!(app.chat_lock_entry.is_empty());
+        assert!(!app.window_focused);
+    }
+
+    #[test]
+    fn a_right_password_unlocks_and_wrong_ones_back_off() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        let now = manual_clock(&mut app);
+        for _ in 0..3 {
+            try_password(&mut app, &ctx, "not the password");
+            assert!(app.app_lock.is_locked());
+            assert!(app.app_lock.wrong);
+        }
+        assert_eq!(app.app_lock.wait_left(), Some(Duration::from_secs(1)));
+        // A try during the wait is not made at all.
+        app.app_lock.entry = PASSWORD.into();
+        app.apply(Action::UnlockApp, &ctx);
+        assert!(!app.app_lock.checking());
+        advance(&now, Duration::from_secs(1));
+        try_password(&mut app, &ctx, PASSWORD);
+        assert!(!app.app_lock.is_locked());
+        assert!(app.app_lock.entry.is_empty());
+    }
+
+    #[test]
+    fn while_locked_actions_do_nothing_and_a_clicked_notification_waits() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        app.chats = vec![Chat::new(CHAT.into(), "Ada".into())];
+        app.open_chat = None;
+        app.apply(Action::OpenChat(CHAT.into()), &ctx);
+        app.apply(Action::Open(Page::Settings), &ctx);
+        app.apply(Action::ShowDialog(Dialog::NewChat), &ctx);
+        app.apply(Action::Unlink, &ctx);
+        assert_eq!(app.open_chat, None);
+        assert_eq!(app.page, Page::Chats);
+        assert_eq!(app.dialog, None);
+
+        app.notification_opens
+            .lock()
+            .unwrap()
+            .push(crate::notify::NotificationTarget {
+                chat: CHAT.into(),
+                message: "m1".into(),
+            });
+        app.handle_notification_opens();
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat, None, "not while locked");
+        try_password(&mut app, &ctx, PASSWORD);
+        assert_eq!(app.open_chat.as_deref(), Some(CHAT), "opened once unlocked");
+    }
+
+    #[test]
+    fn notifications_while_locked_carry_no_chat_sender_text_or_picture() {
+        let mut app = unlocked_app();
+        let message = incoming(&mut app);
+        app.chats[0].notification_sound = Some(crate::settings::NotificationSound::Alert);
+        app.maybe_notify(CHAT, &message);
+        let shown = app.notifications.shown.last().unwrap().clone();
+        assert_eq!(shown.title, "Ada Lovelace");
+        assert_eq!(shown.body, "the engine is ready");
+
+        app.lock_app();
+        app.maybe_notify(CHAT, &message);
+        let shown = app.notifications.shown.last().unwrap();
+        assert_eq!(shown.title, "ZapFast");
+        assert_eq!(shown.body, "New message");
+        assert_eq!(shown.picture, None);
+        assert_eq!(
+            shown.sound, app.settings.message_sound,
+            "the chat's own sound would name it"
+        );
+    }
+
+    #[test]
+    fn messages_arriving_while_locked_stay_unread() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        app.open_chat = Some(CHAT.into());
+        app.window_focused = true;
+        app.background_frame(&ctx);
+        let mut chat = Chat::new(CHAT.into(), "Ada".into());
+        chat.unread = 1;
+        app.handle_chat_updated(chat);
+        assert_eq!(app.chat(CHAT).unwrap().unread, 1);
+    }
+
+    #[test]
+    fn setting_changing_and_turning_off_the_password() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(None));
+        // Changing needs a password to change.
+        app.apply(Action::AppLockForm(Some(FormMode::Change)), &ctx);
+        assert_eq!(app.app_lock.form, None);
+        app.apply(Action::AppLockForm(Some(FormMode::Set)), &ctx);
+        let form = app.app_lock.form.as_mut().unwrap();
+        form.new = "first-password".into();
+        form.confirm = "first-password".into();
+        app.apply(Action::SubmitAppLockForm, &ctx);
+        finish(&mut app, &ctx);
+        assert_eq!(app.app_lock.form, None);
+        let first = app.settings.app_lock_hash.clone().unwrap();
+        assert!(crate::app_lock::verifies(&first, "first-password"));
+        assert!(
+            !app.app_lock.is_locked(),
+            "setting a password does not lock"
+        );
+
+        // A second Set cannot replace it without the current password.
+        app.apply(Action::AppLockForm(Some(FormMode::Set)), &ctx);
+        assert_eq!(app.app_lock.form, None);
+
+        let mut change = Form::new(FormMode::Change);
+        change.current = "wrong".into();
+        change.new = "second-password".into();
+        change.confirm = "second-password".into();
+        app.app_lock.form = Some(change.clone());
+        app.apply(Action::SubmitAppLockForm, &ctx);
+        finish(&mut app, &ctx);
+        let form = app.app_lock.form.as_ref().unwrap();
+        assert_eq!(form.error, Some(FormError::WrongCurrent));
+        assert!(!form.busy);
+        assert_eq!(app.settings.app_lock_hash.as_deref(), Some(first.as_str()));
+
+        change.current = "first-password".into();
+        app.app_lock.form = Some(change);
+        app.apply(Action::SubmitAppLockForm, &ctx);
+        finish(&mut app, &ctx);
+        let second = app.settings.app_lock_hash.clone().unwrap();
+        assert!(crate::app_lock::verifies(&second, "second-password"));
+
+        // Turning off requires the password too.
+        app.apply(Action::AppLockForm(Some(FormMode::TurnOff)), &ctx);
+        app.app_lock.form.as_mut().unwrap().current = "first-password".into();
+        app.apply(Action::SubmitAppLockForm, &ctx);
+        finish(&mut app, &ctx);
+        assert!(app.settings.app_lock_hash.is_some());
+        app.app_lock.form.as_mut().unwrap().current = "second-password".into();
+        app.apply(Action::SubmitAppLockForm, &ctx);
+        finish(&mut app, &ctx);
+        assert_eq!(app.settings.app_lock_hash, None);
+        assert_eq!(app.app_lock.form, None);
+    }
+
+    #[test]
+    fn forgetting_the_password_unlocks_only_after_unlinking() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        app.apply(Action::ForgotAppPassword(true), &ctx);
+        assert_eq!(
+            app.app_lock.forgetting,
+            crate::app_lock::Forgetting::Confirming
+        );
+        app.apply(Action::UnlinkLockedApp, &ctx);
+        assert_eq!(
+            app.app_lock.forgetting,
+            crate::app_lock::Forgetting::Unlinking
+        );
+        assert!(app.app_lock.is_locked(), "still locked until unlinked");
+        app.handle_link(LinkStatus::LoggedOut);
+        assert!(!app.app_lock.is_locked());
+        assert_eq!(app.settings.app_lock_hash, None);
+    }
+
+    #[test]
+    fn the_lock_shortcut_needs_a_password() {
+        let ctx = egui::Context::default();
+        let press = |app: &mut App| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::L,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    }],
+                    ..Default::default()
+                },
+                |ui| crate::ui::keys::handle(app, ui.ctx()),
+            );
+            output.textures_delta.clear();
+            std::mem::take(&mut app.actions)
+        };
+        let mut app = unlocked_app();
+        let actions = press(&mut app);
+        assert!(actions.contains(&Action::LockApp), "{actions:?}");
+        assert!(!actions.contains(&Action::FocusComposer));
+        let mut app = app_with(settings(None));
+        assert!(!press(&mut app).contains(&Action::LockApp));
     }
 }

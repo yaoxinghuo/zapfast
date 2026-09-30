@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PHOTO_CAPTION: &str = "A little poster for launch day ⚡";
+const PHOTO_CAPTION: &str = "Launch day ⚡";
 /// Length of the input-driven launch tour, excluding its optional start delay.
 pub const DURATION: Duration = Duration::from_secs(41);
 
@@ -84,7 +84,7 @@ impl Script {
 pub fn prepare(app: &mut App) {
     common_setup(app);
     super::apply_flags(app, Some("voice"));
-    show_photos(app, PHOTO_CAPTION);
+    show_photos(app, super::stock::LAUNCH, PHOTO_CAPTION);
     if let Some(quote) = app
         .conversations
         .get_mut(super::SAMPLES[0].id)
@@ -143,15 +143,16 @@ fn common_setup(app: &mut App) {
     }
 }
 
-/// Shows fully loaded photos, with `caption` on Ada's, instead of the
-/// deliberately blurry download previews used by the screenshot fixtures.
-fn show_photos(app: &mut App, caption: &str) {
-    let (photo, _) = super::sample_files(app);
-    for (chat, id, caption) in [
-        (super::SAMPLES[0].id, "ada-photo", caption),
+/// Shows fully loaded photos, `photo` with `caption` as Ada's, instead of
+/// the deliberately blurry download previews used by the screenshot fixtures.
+fn show_photos(app: &mut App, photo: super::stock::Photo, caption: &str) {
+    let dir = app.dirs.media_cache_dir();
+    for (chat, id, photo, caption) in [
+        (super::SAMPLES[0].id, "ada-photo", photo, caption),
         (
             super::SAMPLES[1].id,
             "group-photo",
+            super::stock::VENUE,
             "Tonight's meetup, doors at 18:30",
         ),
     ] {
@@ -164,9 +165,10 @@ fn show_photos(app: &mut App, caption: &str) {
                 caption: text,
             } = &mut row.content
         {
-            media.path = Some(photo.clone());
-            media.width = Some(900);
-            media.height = Some(1200);
+            media.path = Some(super::stock::save_photo(&dir, photo));
+            media.width = Some(photo.width);
+            media.height = Some(photo.height);
+            row.thumbnail = Some(super::stock::thumbnail(photo));
             *text = Some(caption.to_owned());
         }
     }
@@ -1235,19 +1237,19 @@ mod tests {
             frame(&mut app, &mut tour, &ctx, Vec::new());
         }
         click(&mut app, &mut tour, &ctx, "Dark");
-        let menu_pos = tour.labels["Nord.json"];
+        let menu_pos = tour.labels["Nord"];
         for name in [
             "Follow system",
             "Light",
             "Dark",
-            "Catppuccin Latte.json",
-            "Catppuccin.json",
-            "Nord.json",
-            "Ristretto.json",
-            "Tokyo Night.json",
-            "Rose Pine.json",
-            "Rose Pine Moon.json",
-            "Rose Pine Dawn.json",
+            "Catppuccin Latte",
+            "Catppuccin",
+            "Nord",
+            "Ristretto",
+            "Tokyo Night",
+            "Rose Pine",
+            "Rose Pine Moon",
+            "Rose Pine Dawn",
         ] {
             // The bundled choices now exceed the popup's visible height.
             // Scroll over the menu, as a user would, to reveal later entries.
@@ -1294,13 +1296,13 @@ mod tests {
                 ],
             );
         }
-        click(&mut app, &mut tour, &ctx, "Nord.json");
+        click(&mut app, &mut tour, &ctx, "Nord");
         assert_eq!(app.settings.custom_theme.as_deref(), Some("Nord.json"));
         assert_eq!(
             app.palette.window,
             egui::Color32::from_rgb(0x2e, 0x34, 0x40)
         );
-        click(&mut app, &mut tour, &ctx, "Nord.json");
+        click(&mut app, &mut tour, &ctx, "Nord");
         click(&mut app, &mut tour, &ctx, "Follow system");
         assert!(app.settings.custom_theme.is_none());
         assert_eq!(app.settings.theme, ThemeChoice::System);

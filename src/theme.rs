@@ -17,6 +17,11 @@ pub type Catalog = fastframe_theme::Catalog<Palette>;
 pub const DESKTOP_THEMES: fastframe_theme::DesktopThemes = fastframe_theme::DesktopThemes {
     slug: "zapfast",
     omarchy_template: include_str!("../contrib/omarchy/zapfast.json.tpl"),
+    // Every template ZapFast shipped before, so an untouched copy installed
+    // by an older release is replaced with the current one.
+    omarchy_previous_templates: &[include_str!(
+        "../contrib/omarchy/previous/zapfast-1.json.tpl"
+    )],
     presets: true,
 };
 
@@ -134,7 +139,7 @@ impl Palette {
             danger: Color32::from_rgb(0xea, 0x00, 0x38),
             warning: Color32::from_rgb(0xa0, 0x6b, 0x00),
             overlay: Color32::from_rgb(0xff, 0xff, 0xff),
-            shadow: Color32::from_black_alpha(50),
+            shadow: Color32::from_black_alpha(LIGHT_SHADOW_ALPHA),
             chat: Color32::from_rgb(0xef, 0xea, 0xe2),
             bubble_in: Color32::from_rgb(0xff, 0xff, 0xff),
             bubble_out: Color32::from_rgb(0xd9, 0xfd, 0xd3),
@@ -156,6 +161,63 @@ impl Palette {
             // Icons need 3:1 (WCAG 1.4.11).
             read: readable_on(fill, self.read, self.text, 3.0),
             ..*self
+        }
+    }
+
+    /// The soft shadow that lifts message bubbles and date chips off the
+    /// wallpaper: two points down with a short blur, a little denser than
+    /// the palette's own shadow colour, so custom themes steer it. A shadow
+    /// alone barely darkens a dark chat; [`Palette::raised_edge`] lights
+    /// the top as well.
+    pub fn bubble_shadow(&self) -> egui::epaint::Shadow {
+        egui::epaint::Shadow {
+            offset: [0, 2],
+            blur: 6,
+            spread: 0,
+            color: denser(self.lift_shadow(), SHADOW_DENSITY),
+        }
+    }
+
+    /// The shadow under a surface that floats over the window for a moment:
+    /// menus, toasts, the emoji picker, and egui's own popups.
+    pub fn float_shadow(&self) -> egui::epaint::Shadow {
+        egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 20,
+            spread: 0,
+            color: self.shadow,
+        }
+    }
+
+    /// The deeper shadow under a modal surface that holds the window until
+    /// it closes: dialogs, the update dialog, and the image preview.
+    pub fn modal_shadow(&self) -> egui::epaint::Shadow {
+        egui::epaint::Shadow {
+            offset: [0, 12],
+            blur: 40,
+            spread: 0,
+            color: self.shadow,
+        }
+    }
+
+    /// The palette's shadow colour, no heavier than the light theme's: a
+    /// dark palette's own shadow is meant for popups and menus, and under
+    /// every bubble it weighed on an otherwise flat theme.
+    pub fn lift_shadow(&self) -> Color32 {
+        let [r, g, b, a] = self.shadow.to_srgba_unmultiplied();
+        Color32::from_rgba_unmultiplied(r, g, b, a.min(LIGHT_SHADOW_ALPHA))
+    }
+
+    /// The faint light along the top edge of a raised surface of colour
+    /// `fill`. In a dark theme the fill moves a little toward the text
+    /// colour, so it follows every dark palette, mid-dark ones included; in
+    /// a light one, where the text is dark, it moves toward white instead,
+    /// which shows on tinted surfaces and vanishes on white ones.
+    pub fn raised_edge(&self, fill: Color32) -> Color32 {
+        if self.dark {
+            fill.lerp_to_gamma(self.text, DARK_EDGE_TINT)
+        } else {
+            fill.lerp_to_gamma(Color32::WHITE, LIGHT_EDGE_TINT)
         }
     }
 
@@ -222,12 +284,14 @@ impl fastframe_theme::Palette for Palette {
         if given.contains("window") && !given.contains("chat") {
             self.chat = self.window;
         }
+        // Bubbles stand a little further from the chat than the interface's
+        // surfaces do, keeping text on them at 4.5:1 in every shared palette.
         if given.contains("surface") && !given.contains("bubble_in") {
-            self.bubble_in = self.surface;
+            self.bubble_in = self.surface.lerp_to_gamma(self.text, 0.05);
         }
         if given.contains("accent") {
             if !given.contains("bubble_out") {
-                self.bubble_out = self.surface.lerp_to_gamma(self.accent, 0.18);
+                self.bubble_out = self.surface.lerp_to_gamma(self.accent, 0.24);
             }
             if !given.contains("link") {
                 self.link = self.accent;
@@ -240,6 +304,24 @@ impl fastframe_theme::Palette for Palette {
             self.overlay = self.panel;
         }
     }
+}
+
+/// How much denser than the palette's shadow colour a bubble's shadow is.
+const SHADOW_DENSITY: f32 = 1.04;
+/// How far a dark theme's raised edge moves from the surface toward the text.
+const DARK_EDGE_TINT: f32 = 0.128;
+/// The light palette's shadow opacity, the most a raised surface casts.
+const LIGHT_SHADOW_ALPHA: u8 = 50;
+/// How far a light theme's raised edge moves from the surface toward white.
+const LIGHT_EDGE_TINT: f32 = 0.48;
+/// How thick the raised edge is, in points.
+pub const RAISED_EDGE: f32 = 1.0;
+
+/// `color` with its opacity scaled by `factor`, up to opaque.
+fn denser(color: Color32, factor: f32) -> Color32 {
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    let alpha = (f32::from(a) * factor).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(r, g, b, alpha)
 }
 
 /// Converts HSL to color bytes for non-egui drawing.
@@ -287,6 +369,17 @@ pub fn bold(size: f32) -> egui::FontId {
     fastframe_fonts::Weight::Bold.font_id(size)
 }
 
+/// The face for counting timers (recording, playback positions): Inter at
+/// `weight`, whose figures are all one width, so a timer does not shift as
+/// it counts. San Francisco and Segoe UI draw proportional figures.
+pub fn tabular(weight: fastframe_fonts::Weight, size: f32) -> egui::FontId {
+    egui::FontId::new(size, tabular_family(weight))
+}
+
+fn tabular_family(weight: fastframe_fonts::Weight) -> egui::FontFamily {
+    egui::FontFamily::Name(format!("zapfast-tabular-{}", weight.name()).into())
+}
+
 /// Installs fonts, icons, and base style.
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
@@ -327,18 +420,8 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     visuals.window_stroke = Stroke::new(1.0, palette.outline);
     visuals.window_corner_radius = CornerRadius::same(RADIUS + 2);
     visuals.menu_corner_radius = CornerRadius::same(RADIUS);
-    visuals.window_shadow = egui::epaint::Shadow {
-        offset: [0, 6],
-        blur: 24,
-        spread: 0,
-        color: palette.shadow,
-    };
-    visuals.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 4],
-        blur: 16,
-        spread: 0,
-        color: palette.shadow,
-    };
+    visuals.window_shadow = palette.modal_shadow();
+    visuals.popup_shadow = palette.float_shadow();
     let corner = CornerRadius::same(RADIUS_SMALL + 2);
     for widget in [
         &mut visuals.widgets.inactive,
@@ -405,12 +488,66 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     ctx.set_global_style(style);
 }
 
-/// Inter at four weights, egui's own fonts behind it, and installed fonts
-/// for the scripts Inter lacks, hinted as the desktop asks.
+/// Whether the interface is drawn in the bundled Inter instead of the
+/// platform's font (Settings, Appearance, Font).
+static INTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Chooses the interface's typeface and installs it. Call it before
+/// [`install`] with the saved choice, and again when the choice changes.
+pub fn set_font(ctx: &egui::Context, font: crate::settings::FontChoice) {
+    let inter = font == crate::settings::FontChoice::Inter;
+    if INTER.swap(inter, std::sync::atomic::Ordering::AcqRel) != inter {
+        install_fonts(ctx);
+    }
+}
+
+/// Whether Inter is the chosen typeface.
+#[cfg(test)]
+pub fn inter_chosen() -> bool {
+    INTER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The typeface the interface is asked to draw with: the setting's, and
+/// always Inter in tests, so layouts do not depend on the machine.
+fn primary_font() -> fastframe_fonts::Primary {
+    if cfg!(test) || INTER.load(std::sync::atomic::Ordering::Acquire) {
+        fastframe_fonts::Primary::Inter
+    } else {
+        fastframe_fonts::Primary::System
+    }
+}
+
+/// The chosen interface font at four weights (the platform's, or Inter
+/// where there is none), egui's own fonts behind it, and installed fonts
+/// for the scripts it lacks, hinted as the desktop asks. Inter also draws
+/// the [`tabular`] timers.
 fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = fastframe_fonts::FontSetup::default().definitions();
+    let primary = primary_font();
+    let mut fonts = fastframe_fonts::FontSetup::default()
+        .primary(primary)
+        .definitions();
+    add_tabular(&mut fonts);
     text_rendering().apply_to(&mut fonts);
     ctx.set_fonts(fonts);
+}
+
+/// Registers Inter at each weight as the [`tabular`] families, each falling
+/// back like the interface family of the same weight.
+fn add_tabular(fonts: &mut egui::FontDefinitions) {
+    use fastframe_fonts::Weight;
+    for weight in Weight::ALL {
+        let name = format!("zapfast-tabular-{}", weight.name());
+        let mut data = egui::FontData::from_static(fastframe_fonts::INTER);
+        data.tweak.coords = egui::epaint::text::VariationCoords::new([(b"wght", weight.value())]);
+        fonts
+            .font_data
+            .insert(name.clone(), std::sync::Arc::new(data));
+        let mut family = vec![name];
+        if let Some(behind) = fonts.families.get(&weight.family()) {
+            family.extend(behind.iter().cloned());
+        }
+        fonts.families.insert(tabular_family(weight), family);
+    }
 }
 
 /// The desktop's text rendering: read once, on the first window, and kept
@@ -492,6 +629,8 @@ fastframe_icons::icons! {
         CircleX => lucide "circle-x",
         Clock => lucide "clock",
         Contact => "contact",
+        DeliveryTick => "delivery-tick",
+        DeliveryTicks => "delivery-ticks",
         Copy => lucide "copy",
         Download => "download",
         Timer => "timer",
@@ -633,13 +772,40 @@ pub fn circle_button(
     }
 }
 
-/// Draws the app logo.
+/// Draws the app's mark as it ships: the lit disc and the ink bubble of
+/// `packaging/icons/zapfast.svg`, rendered once per pixel size.
+pub fn mark(ui: &egui::Ui, center: egui::Pos2, diameter: f32) {
+    let ctx = ui.ctx();
+    let pixels = (diameter * ctx.pixels_per_point()).round().max(1.0) as usize;
+    let id = egui::Id::new(("zapfast-mark", pixels));
+    let texture = match ctx.data_mut(|data| data.get_temp::<egui::TextureHandle>(id)) {
+        Some(texture) => texture,
+        None => {
+            let rgba = crate::util::app_icon_rgba(pixels);
+            let image = egui::ColorImage::from_rgba_unmultiplied([pixels, pixels], &rgba);
+            let texture = ctx.load_texture(
+                format!("zapfast-mark-{pixels}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+            texture
+        }
+    };
+    let rect = egui::Rect::from_center_size(center, Vec2::splat(diameter));
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+}
+
+/// Draws the logo's shape in two flat colours, for the empty conversation's
+/// faint watermark.
 pub fn logo(ui: &egui::Ui, center: egui::Pos2, diameter: f32, disc: Color32, glyph: Color32) {
     ui.painter().circle_filled(center, diameter / 2.0, disc);
-    // Match `packaging/icons/zapfast.svg`.
-    let icon_size = diameter * 0.56;
+    // Match `packaging/icons/zapfast-small.svg`: the bubble sits a little
+    // right of and above the centre, where its tail balances it.
+    let icon_size = diameter * 0.674;
     let icon_rect = egui::Rect::from_center_size(
-        center - Vec2::new(0.0, diameter * 0.02),
+        center + Vec2::new(diameter * 0.009, -diameter * 0.009),
         Vec2::splat(icon_size),
     );
     Icon::MessageCircle
@@ -714,7 +880,7 @@ pub fn soft_button(
     active: bool,
 ) -> Response {
     let font = medium(13.0);
-    let color = if active { palette.window } else { palette.text };
+    let color = if active { palette.accent } else { palette.text };
     let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
     let icon_size = 15.0;
     let icon_width = if icon.is_some() { icon_size + 6.0 } else { 0.0 };
@@ -722,11 +888,15 @@ pub fn soft_button(
     let size = Vec2::new(galley.size().x + icon_width, galley.size().y) + padding * 2.0;
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     reveal_focus(&response);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, label)
+    });
     focus_outline(ui, response.id, rect, rect.height() / 2.0);
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
+        // Active as a selected filter chip is: a tint of the accent.
         let fill = if active {
-            palette.text
+            palette.accent.gamma_multiply(0.18)
         } else if hovered {
             palette.surface_hover
         } else {
@@ -996,6 +1166,95 @@ pub fn titlebar_inset(ctx: &egui::Context) -> f32 {
 mod tests {
     use super::*;
 
+    /// Timers count in Inter's tabular figures whatever face draws the
+    /// rest, and fall back like the interface text of their weight.
+    #[test]
+    fn timers_count_in_figures_of_one_width() {
+        use fastframe_fonts::Weight;
+        let mut fonts = fastframe_fonts::FontSetup::default().definitions();
+        add_tabular(&mut fonts);
+        for weight in Weight::ALL {
+            let family = &fonts.families[&tabular_family(weight)];
+            assert_eq!(family[0], format!("zapfast-tabular-{}", weight.name()));
+            assert_eq!(family[1..], fonts.families[&weight.family()][..]);
+        }
+        let ctx = egui::Context::default();
+        ctx.set_fonts(fonts);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        let widths: Vec<f32> = ["0:00", "1:11", "8:48"]
+            .into_iter()
+            .map(|time| {
+                ctx.fonts_mut(|fonts| {
+                    fonts
+                        .layout_no_wrap(
+                            time.into(),
+                            tabular(Weight::Medium, 14.0),
+                            egui::Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                })
+            })
+            .collect();
+        ctx.tex_manager().write().take_delta().clear();
+        assert!(
+            widths.iter().all(|width| (width - widths[0]).abs() < 0.01),
+            "{widths:?}"
+        );
+    }
+
+    #[test]
+    fn raised_surfaces_get_a_lit_edge_and_a_denser_shadow() {
+        let preset = |name: &str| {
+            crate::theme::presets()
+                .find(|theme| theme.filename == name)
+                .unwrap()
+                .palette
+        };
+        // A mid-dark custom palette follows too.
+        let mut mid = Palette::dark();
+        mid.chat = Color32::from_rgb(0x3a, 0x3f, 0x4b);
+        mid.bubble_in = Color32::from_rgb(0x4c, 0x52, 0x60);
+        let palettes = [
+            Palette::dark(),
+            preset("Catppuccin.json"),
+            mid,
+            Palette::light(),
+            preset("Catppuccin Latte.json"),
+        ];
+        let luminance = |color: Color32| contrast(color, Color32::BLACK);
+        for palette in palettes {
+            for fill in [palette.bubble_in, palette.bubble_out, palette.panel] {
+                let edge = palette.raised_edge(fill);
+                // Lighter than the surface, or the same where it is white.
+                assert!(
+                    luminance(edge) > luminance(fill) || fill == Color32::WHITE,
+                    "{fill:?} -> {edge:?}"
+                );
+                if palette.dark {
+                    // Close to a bubble: a hint, not an outline.
+                    if fill != palette.panel {
+                        let lift = contrast(edge, palette.chat) / contrast(fill, palette.chat);
+                        assert!(lift > 1.05 && lift < 1.6, "{fill:?} -> {edge:?}: {lift}");
+                    }
+                } else {
+                    // Toward white, never toward the dark text.
+                    assert_eq!(edge, fill.lerp_to_gamma(Color32::WHITE, LIGHT_EDGE_TINT));
+                }
+            }
+            // The same lift in every theme, as heavy as the light theme's.
+            let shadow = palette.bubble_shadow();
+            assert_eq!((shadow.offset, shadow.blur), ([0, 2], 6));
+            assert_eq!(
+                shadow.color,
+                Palette::light().bubble_shadow().color,
+                "{:?}",
+                palette.shadow
+            );
+        }
+    }
+
     /// The palette decides the theme, and the desktop's rendering its text
     /// options: linear coverage in both themes on Linux, as GTK draws it.
     #[test]
@@ -1097,6 +1356,19 @@ mod tests {
         }
     }
 
+    /// WCAG contrast ratio between two opaque colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let luminance = |color: Color32| {
+            let linear = egui::Rgba::from(color);
+            0.2126 * linear.r() + 0.7152 * linear.g() + 0.0722 * linear.b()
+        };
+        let (light, dark) = {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b), a.min(b))
+        };
+        (light + 0.05) / (dark + 0.05)
+    }
+
     #[test]
     fn spotifast_palettes_also_colour_the_conversation() {
         let themes: Vec<_> = presets().collect();
@@ -1104,9 +1376,29 @@ mod tests {
         for theme in themes {
             let palette = theme.palette;
             assert_eq!(palette.chat, palette.window);
-            assert_eq!(palette.bubble_in, palette.surface);
+            assert_eq!(
+                palette.bubble_in,
+                palette.surface.lerp_to_gamma(palette.text, 0.05)
+            );
             assert_ne!(palette.bubble_out, palette.bubble_in);
             assert_eq!(palette.link, palette.accent);
+            // Bubbles stand out from the chat more than surfaces do, and
+            // their text stays readable.
+            let name = &theme.filename;
+            assert!(
+                contrast(palette.bubble_in, palette.chat) > contrast(palette.surface, palette.chat),
+                "{name}: incoming bubbles stand out"
+            );
+            assert!(
+                contrast(palette.bubble_out, palette.chat) > 1.35,
+                "{name}: outgoing bubbles stand out"
+            );
+            for bubble in [palette.bubble_in, palette.bubble_out] {
+                assert!(
+                    contrast(palette.text, bubble) >= 4.5,
+                    "{name}: text on {bubble:?} is readable"
+                );
+            }
             assert_eq!(
                 palette.dark,
                 !matches!(
@@ -1199,6 +1491,12 @@ mod tests {
             );
         }
         assert_eq!(DESKTOP_THEMES.omarchy_template, TEMPLATE);
+        // A copy of the current template is never taken for an outdated one.
+        assert!(
+            !DESKTOP_THEMES
+                .omarchy_previous_templates
+                .contains(&TEMPLATE)
+        );
     }
 
     /// The hook packages install must be the one fastframe-theme describes.

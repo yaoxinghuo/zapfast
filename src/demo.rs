@@ -1,5 +1,6 @@
 //! Offline sample data for screenshots, recorded tours, and headless UI tests.
 
+pub mod stock;
 pub mod tour;
 
 use std::collections::HashMap;
@@ -26,30 +27,9 @@ struct Sample {
     lines: &'static [(bool, &'static str)],
 }
 
-/// Generates a small JPEG attachment preview.
+/// A small JPEG attachment preview: one of the stock pictures, by `seed`.
 pub fn sample_thumbnail(seed: u32) -> Vec<u8> {
-    let (width, height) = (64u32, 48u32);
-    let mut image = image::RgbImage::new(width, height);
-    for (x, y, pixel) in image.enumerate_pixels_mut() {
-        let t = x as f32 / width as f32;
-        let u = y as f32 / height as f32;
-        let hue = ((seed * 37) % 360) as f32;
-        let base = crate::theme::hsl_rgb(hue, 0.45, 0.35 + 0.3 * u);
-        let dark = ((x as i32 - 40).pow(2) + (y as i32 - 30).pow(2)) < 120;
-        *pixel = if dark {
-            image::Rgb([30, 30, 34])
-        } else {
-            image::Rgb([
-                (base[0] as f32 * (0.7 + 0.3 * t)) as u8,
-                (base[1] as f32 * (0.7 + 0.3 * t)) as u8,
-                (base[2] as f32 * (0.7 + 0.3 * t)) as u8,
-            ])
-        };
-    }
-    let mut bytes = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 70);
-    let _ = encoder.encode_image(&image);
-    bytes
+    stock::thumbnail_for(seed)
 }
 
 /// A small street-map picture standing in for a location's map preview.
@@ -304,6 +284,7 @@ fn plant_avatars(app: &mut App) {
     }
     let mut everyone: Vec<String> = sample_ids().iter().map(|id| (*id).to_owned()).collect();
     everyone.push(ME.to_owned());
+    everyone.extend(app.contacts.keys().cloned());
     for chat in &app.chats {
         everyone.extend(chat.participants.iter().cloned());
     }
@@ -313,7 +294,12 @@ fn plant_avatars(app: &mut App) {
         } else {
             "person"
         };
-        let path = dir.join(format!("demo-{kind}-{}.jpg", crate::util::hue(&id) as u32));
+        let name = format!("demo-{kind}-{}.jpg", crate::util::hue(&id) as u32);
+        if let Some(picture) = stock::avatar(&id) {
+            app.adopt_avatar(&id, stock::save(&dir, &name, picture));
+            continue;
+        }
+        let path = dir.join(name);
         if !path.exists() {
             let picture = painted_avatar(&id);
             if picture.save(&path).is_err() {
@@ -324,7 +310,8 @@ fn plant_avatars(app: &mut App) {
     }
 }
 
-/// Generates one 128-pixel id-colored profile picture.
+/// Generates one 128-pixel id-colored profile picture, for the chats
+/// without a stock one.
 fn painted_avatar(id: &str) -> image::RgbImage {
     let hue = crate::util::hue(id);
     let motif = (crate::util::hue(&format!("motif-{id}")) as u32) % 4;
@@ -416,48 +403,8 @@ fn tint(hue: f32, saturation: f32, value: f32) -> image::Rgb<u8> {
 
 fn sample_files(app: &App) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = app.dirs.media_cache_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let photo = dir.join("demo-photo.jpg");
-    if !photo.exists() {
-        let (width, height) = (900u32, 1200u32);
-        let mut image = image::RgbImage::new(width, height);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            let t = y as f32 / height as f32;
-            let base = crate::theme::hsl_rgb(200.0 + 40.0 * t, 0.5, 0.35 + 0.35 * t);
-            let ring = ((x as i32 - 450).pow(2) + (y as i32 - 700).pow(2)) as f32;
-            let on_ring = (ring.sqrt() - 260.0).abs() < 14.0;
-            *pixel = if on_ring {
-                image::Rgb([250, 244, 220])
-            } else {
-                image::Rgb(base)
-            };
-        }
-        let _ = image.save(&photo);
-    }
-    let sticker = dir.join("demo-sticker.gif");
-    if !sticker.exists()
-        && let Ok(file) = std::fs::File::create(&sticker)
-    {
-        let mut encoder = image::codecs::gif::GifEncoder::new(file);
-        let _ = encoder.set_repeat(image::codecs::gif::Repeat::Infinite);
-        for step in 0..8u32 {
-            let mut frame = image::RgbaImage::from_pixel(160, 160, image::Rgba([0, 0, 0, 0]));
-            let angle = step as f32 * std::f32::consts::TAU / 8.0;
-            let (cx, cy) = (80.0 + 40.0 * angle.cos(), 80.0 + 40.0 * angle.sin());
-            for (x, y, pixel) in frame.enumerate_pixels_mut() {
-                let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
-                if d < 28.0 {
-                    *pixel = image::Rgba([255, 200, 60, 255]);
-                }
-            }
-            let _ = encoder.encode_frame(image::Frame::from_parts(
-                frame,
-                0,
-                0,
-                image::Delay::from_numer_denom_ms(120, 1),
-            ));
-        }
-    }
+    let photo = stock::save_photo(&dir, stock::SPACEWALK);
+    let sticker = stock::save(&dir, "demo-sticker.webp", stock::ANIMATED_STICKER);
     (photo, sticker)
 }
 
@@ -483,6 +430,7 @@ pub fn populate(app: &mut App) {
             Contact {
                 id: id.to_owned(),
                 full_name: Some(name.to_owned()),
+                first_name: None,
                 push_name: None,
             },
         );
@@ -493,6 +441,7 @@ pub fn populate(app: &mut App) {
         Contact {
             id: "12025550137@s.whatsapp.net".to_owned(),
             full_name: Some("Dorothy Vaughan".to_owned()),
+            first_name: None,
             push_name: None,
         },
     );
@@ -552,6 +501,10 @@ pub fn populate(app: &mut App) {
                 .chain(std::iter::once(ME.to_owned()))
                 .collect();
             chat.read_only = sample.name == "Section 8 Berlin";
+            // Rust Berlin lets every member edit its info, Family is locked
+            // but we are an admin, and Section 8 Berlin is locked for us.
+            chat.info_locked = Some(sample.name != "Rust Berlin");
+            chat.admin = sample.name == "Family";
         }
         chat.last = conversation
             .messages
@@ -584,10 +537,15 @@ pub fn populate(app: &mut App) {
                 base + 30,
                 Content::Image {
                     caption: Some("The difference engine, finally assembled".into()),
-                    media: media("image/jpeg", 1_843_201, Some(1600), Some(1200)),
+                    media: media(
+                        "image/jpeg",
+                        1_843_201,
+                        Some(stock::ENGINE.width),
+                        Some(stock::ENGINE.height),
+                    ),
                 },
             );
-            row.thumbnail = Some(sample_thumbnail(1));
+            row.thumbnail = Some(stock::thumbnail(stock::ENGINE));
             row.reactions.push(Reaction {
                 sender: ME.into(),
                 from_me: true,
@@ -670,7 +628,7 @@ pub fn populate(app: &mut App) {
                     }),
                 },
             );
-            row.thumbnail = Some(sample_thumbnail(3));
+            row.thumbnail = Some(stock::thumbnail(stock::SPOTIFAST));
             row
         },
     ];
@@ -689,7 +647,7 @@ pub fn populate(app: &mut App) {
                     note: false,
                 },
             );
-            row.thumbnail = Some(sample_thumbnail(2));
+            row.thumbnail = Some(stock::thumbnail(stock::LAUNCH));
             row
         },
         message(
@@ -716,7 +674,12 @@ pub fn populate(app: &mut App) {
                 older + 60 * 18,
                 Content::Image {
                     caption: None,
-                    media: media("image/jpeg", 402_113, Some(900), Some(1200)),
+                    media: media(
+                        "image/jpeg",
+                        stock::SPACEWALK.bytes.len() as u64,
+                        Some(stock::SPACEWALK.width),
+                        Some(stock::SPACEWALK.height),
+                    ),
                 },
             );
             row.forwarded = true;
@@ -732,7 +695,12 @@ pub fn populate(app: &mut App) {
                 true,
                 older + 60 * 19,
                 Content::Sticker {
-                    media: media("image/webp", 20_000, Some(160), Some(160)),
+                    media: media(
+                        "image/webp",
+                        stock::ANIMATED_STICKER.len() as u64,
+                        Some(256),
+                        Some(256),
+                    ),
                     animated: true,
                 },
             );
@@ -773,6 +741,18 @@ pub fn populate(app: &mut App) {
             row.thumbnail = Some(sample_map());
             row
         },
+        // A photo sent to be viewed once, which opens only on the phone.
+        message(
+            ada,
+            "ada-view-once",
+            false,
+            older + 60 * 22,
+            Content::PhoneOnly {
+                view_once: true,
+                live_location: false,
+                once: Some(crate::model::OnceMedia::Photo),
+            },
+        ),
         message(ada, "ada-deleted", false, older + 60 * 25, Content::Revoked),
     ];
     let conversation = app.conversations.get_mut(ada).expect("sample chat");
@@ -792,12 +772,17 @@ pub fn populate(app: &mut App) {
                 group_base + 60,
                 Content::Image {
                     caption: Some("Tonight's venue, doors at 18:30".into()),
-                    media: media("image/jpeg", 1_204_551, Some(1600), Some(1200)),
+                    media: media(
+                        "image/jpeg",
+                        1_204_551,
+                        Some(stock::VENUE.width),
+                        Some(stock::VENUE.height),
+                    ),
                 },
             );
             row.sender = tom.0.to_owned();
             row.sender_name = Some(tom.1.to_owned());
-            row.thumbnail = Some(sample_thumbnail(2));
+            row.thumbnail = Some(stock::thumbnail(stock::VENUE));
             row.reactions.push(Reaction {
                 sender: jonas.0.into(),
                 from_me: false,
@@ -940,13 +925,26 @@ fn shared_pack_sample(app: &mut App, open: bool) {
     }
 }
 
-/// Opens the sticker tab on `shelf` with emoji stickers tagged the way
-/// WhatsApp tags them, a Signal-style pack, and a pack made here.
+/// Opens the sticker tab on `shelf` with stock and emoji stickers tagged the
+/// way WhatsApp tags them, a Signal-style pack, and a pack made here.
 fn sticker_sample(app: &mut App, shelf: crate::model::StickerShelf, search: &str) {
     let dir = app.dirs.media_cache_dir().join("demo-stickers");
     let _ = std::fs::create_dir_all(&dir);
     let make = |character: char| -> Option<std::path::PathBuf> {
         let path = dir.join(format!("{:x}.webp", character as u32));
+        if let Some(sticker) = stock::sticker(character) {
+            // A captioned stock sticker, tagged with its emoji as WhatsApp's are.
+            let info = crate::sticker_meta::StickerInfo {
+                emojis: vec![character.to_string()],
+                ..Default::default()
+            };
+            let tagged = crate::sticker_meta::write(sticker, &info)?;
+            return Some(stock::save(
+                &dir,
+                &format!("{:x}.webp", character as u32),
+                &tagged,
+            ));
+        }
         if !path.exists() {
             let emoji = tour::media::emoji_image(character, 150).ok()?;
             let mut tile = image::RgbaImage::new(192, 192);
@@ -967,7 +965,7 @@ fn sticker_sample(app: &mut App, shelf: crate::model::StickerShelf, search: &str
         characters.chars().filter_map(&make).collect()
     };
     app.picker = Some(crate::model::PickerTab::Stickers);
-    app.stickers = set("😂🐸🎉👋😎🚀🥳🙏🔥");
+    app.stickers = set("🤣🐸🚀🙅🥱🐶🦉🎉🔥");
     app.stickers_saved = set("❤😍🤣🐱");
     app.stickers_received = set("🐶🌮🎈🦄");
     let ducks = set("🦆🐤🐣🐥🦢🪿");
@@ -1017,6 +1015,8 @@ fn quote_sample(app: &mut App) {
     if let Some(index) = quoted {
         let original = &conversation.messages[index];
         let (sender, sender_name) = (original.sender.clone(), original.sender_name.clone());
+        // The quoted reply mentions Jonas, so the quote names him too.
+        let (summary, mentions) = (original.summary(), original.mentions.clone());
         let mut reply = message(
             group,
             "quote-own",
@@ -1028,11 +1028,54 @@ fn quote_sample(app: &mut App) {
             id: "group-reply".into(),
             sender,
             sender_name,
-            summary: "will do, front row".into(),
-            mentions: Vec::new(),
+            summary,
+            mentions,
         });
         conversation.messages.insert(index + 1, reply);
     }
+}
+
+/// A chat with Meta AI: a question and a rich reply, drawn as the text the
+/// worker makes of it (#253).
+fn meta_ai_sample(app: &mut App) {
+    let id = "15550100000@s.whatsapp.net";
+    let now = crate::util::now();
+    let question = message(
+        id,
+        "meta-ai-question",
+        true,
+        now - 60,
+        Content::text("How do I reverse a string in Rust?"),
+    );
+    let mut reply = message(
+        id,
+        "meta-ai-reply",
+        false,
+        now,
+        Content::text(
+            "Collect its characters in reverse order:\n\n```\nlet reversed: String = text.chars().rev().collect();\n```\n\nMethod | Handles\nchars().rev() | Unicode scalar values\ngraphemes(true).rev() | Combined emoji and accents",
+        ),
+    );
+    reply.quoted = Some(Quoted {
+        id: "meta-ai-question".into(),
+        sender: ME.into(),
+        sender_name: None,
+        summary: "How do I reverse a string in Rust?".into(),
+        mentions: Vec::new(),
+    });
+    let mut chat = Chat::new(id.into(), "Meta AI".into());
+    chat.last_activity = now;
+    chat.last = Some(crate::model::LastMessage {
+        from_me: false,
+        sender: reply.sender.clone(),
+        sender_name: None,
+        summary: reply.summary(),
+        full: reply.content.full_summary(),
+        status: reply.status,
+    });
+    app.chats.insert(0, chat);
+    app.conversations.entry(id.into()).or_default().messages = vec![question, reply];
+    app.open_chat = Some(id.into());
 }
 
 /// A Recent shelf of animated stickers, more frames than the animation cache
@@ -1448,8 +1491,64 @@ fn message_info_sample(app: &mut App, recorded: bool) {
     });
 }
 
-/// A three-second H.264 and AAC clip, the same one the video tests decode.
-const DEMO_VIDEO: &[u8] = include_bytes!("../tests/fixtures/video/sample.mp4");
+/// Pictures with and without captions, forwarded or not, from both sides,
+/// so the forwarded label and the time over a picture can be checked.
+fn photos_sample(app: &mut App) {
+    let id = SAMPLES[0].id;
+    let now = crate::util::now();
+    let dir = app.dirs.media_cache_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    // Light towards the top; the time sits over the dark of its lower corner.
+    let wide = stock::save_photo(&dir, stock::DUSK);
+    let photo = |caption: Option<&str>| {
+        let mut media = media(
+            "image/jpeg",
+            stock::DUSK.bytes.len() as u64,
+            Some(stock::DUSK.width),
+            Some(stock::DUSK.height),
+        );
+        media.path = Some(wide.clone());
+        Content::Image {
+            caption: caption.map(str::to_owned),
+            media,
+        }
+    };
+    let mut rows = vec![
+        message(
+            id,
+            "photos-caption",
+            true,
+            0,
+            photo(Some("The launch, from the causeway")),
+        ),
+        message(id, "photos-in", false, 0, photo(None)),
+        message(id, "photos-out", true, 0, photo(None)),
+        message(
+            id,
+            "photos-forwarded-in",
+            false,
+            0,
+            Content::text("Minutes from Tuesday, as promised"),
+        ),
+        message(
+            id,
+            "photos-forwarded-out",
+            true,
+            0,
+            Content::text("Passing this along"),
+        ),
+    ];
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.timestamp = now - 600 + index as i64 * 100;
+        row.forwarded = matches!(
+            row.id.as_str(),
+            "photos-forwarded-in" | "photos-forwarded-out" | "photos-in"
+        );
+    }
+    app.conversations.entry(id.into()).or_default().messages = rows;
+    app.open_chat = Some(id.into());
+    app.scroll_to_bottom = true;
+}
 
 /// Replaces the first chat with videos: a downloaded one, a round video
 /// message of our own, and one still on WhatsApp's servers. `play` starts
@@ -1457,18 +1556,23 @@ const DEMO_VIDEO: &[u8] = include_bytes!("../tests/fixtures/video/sample.mp4");
 fn video_sample(app: &mut App, play: Option<&str>) {
     let id = SAMPLES[0].id;
     let now = crate::util::now();
-    let path = app.dirs.media_cache_dir().join("demo-video.mp4");
-    let _ = std::fs::create_dir_all(app.dirs.media_cache_dir());
-    let _ = std::fs::write(&path, DEMO_VIDEO);
+    let dir = app.dirs.media_cache_dir();
+    let path = stock::save(&dir, "demo-video.mp4", stock::VIDEO);
+    let round = stock::save(&dir, "demo-note.mp4", stock::NOTE);
     let clip = |note: bool, downloaded: bool| {
-        let mut media = media("video/mp4", DEMO_VIDEO.len() as u64, Some(320), Some(180));
+        let (bytes, side, file) = if note {
+            (stock::NOTE, (360, 360), &round)
+        } else {
+            (stock::VIDEO, (640, 360), &path)
+        };
+        let mut media = media("video/mp4", bytes.len() as u64, Some(side.0), Some(side.1));
         if downloaded {
-            media.path = Some(path.clone());
+            media.path = Some(file.clone());
         }
         Content::Video {
             caption: None,
             media,
-            seconds: Some(3),
+            seconds: Some(stock::CLIP_SECONDS),
             gif: false,
             note,
         }
@@ -1484,7 +1588,7 @@ fn video_sample(app: &mut App, play: Option<&str>) {
         rows.push(playing);
     }
     for (index, row) in rows.iter_mut().enumerate() {
-        row.thumbnail = Some(sample_thumbnail(index as u32 + 5));
+        row.thumbnail = Some(stock::thumbnail(stock::LAUNCH));
         row.timestamp = now - 300 + index as i64 * 100;
     }
     app.conversations.entry(id.into()).or_default().messages = rows;
@@ -1494,7 +1598,7 @@ fn video_sample(app: &mut App, play: Option<&str>) {
     if let Some(message) = play {
         app.actions.push(crate::model::Action::PlayVideo {
             message: message.into(),
-            path,
+            path: if message == "demo-note" { round } else { path },
         });
     }
 }
@@ -1556,6 +1660,37 @@ fn labels_sample(app: &mut App) {
     }
 }
 
+/// A synthetic dusk gradient as the wallpaper image, shown at once. The file
+/// is never written: the sample hands the decoded image over directly.
+/// Sets the demo password ("demo-password") and locks.
+fn app_lock_sample(app: &mut App) {
+    app.settings.app_lock_hash = Some(crate::app_lock::verifier("demo-password"));
+    app.lock_app();
+}
+
+fn wallpaper_image_sample(app: &mut App) {
+    let (width, height) = (1600usize, 1000usize);
+    let pixels = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                let across = x as f32 / width as f32;
+                let down = y as f32 / height as f32;
+                let sun =
+                    (1.0 - ((across - 0.7).powi(2) + (down - 0.35).powi(2)).sqrt() * 3.0).max(0.0);
+                egui::Color32::from_rgb(
+                    (40.0 + 150.0 * down + 60.0 * sun) as u8,
+                    (50.0 + 60.0 * down + 50.0 * sun) as u8,
+                    (110.0 - 40.0 * down + 20.0 * sun) as u8,
+                )
+            })
+        })
+        .collect();
+    let image = egui::ColorImage::new([width, height], pixels);
+    let path = app.dirs.wallpaper_file("png");
+    app.wallpaper_image.show_now(&path, image);
+    app.settings.wallpaper_image = Some(path);
+}
+
 pub fn apply_flags(app: &mut App, page: Option<&str>) {
     let Some(page) = page else {
         return;
@@ -1580,8 +1715,27 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
             "poll-empty" => poll_sample(app, false, false),
             "poll-voted" => poll_sample(app, true, false),
             "poll-results" => poll_sample(app, true, true),
+            "photos" => photos_sample(app),
+            "drafts" => {
+                // Unsent text in two chats besides the open one, whose
+                // draft is in the composer.
+                app.drafts
+                    .insert(SAMPLES[3].id.into(), "Bring the spare HDMI adapter".into());
+                app.drafts.insert(
+                    SAMPLES[2].id.into(),
+                    "Sounds good, see you at\nthe station".into(),
+                );
+                app.composer = "Still typing this one".into();
+            }
             "video" => video_sample(app, None),
             "video-playing" => video_sample(app, Some("demo-video")),
+            "video-expanded" => {
+                video_sample(app, None);
+                app.actions.push(crate::model::Action::ExpandVideo {
+                    message: "demo-video".into(),
+                    path: app.dirs.media_cache_dir().join("demo-video.mp4"),
+                });
+            }
             "shared-contact" => {
                 let chat = SAMPLES[0].id;
                 let now = crate::util::now();
@@ -1620,6 +1774,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 )];
                 app.open_chat = Some(id.into());
             }
+            "meta-ai" => meta_ai_sample(app),
             "locked" => {
                 app.chats[0].locked = true;
                 app.open_chat = None;
@@ -1631,6 +1786,36 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.open_chat = None;
             }
             "locked-setup" => app.dialog = Some(crate::model::Dialog::UnlockLockedChats),
+            // The app lock's screen, over the sample chats it hides.
+            "app-lock" => app_lock_sample(app),
+            "app-lock-wrong" => {
+                app_lock_sample(app);
+                // Enough wrong tries for an eight-second wait.
+                for _ in 0..6 {
+                    app.app_lock.unlocked(false);
+                }
+            }
+            "app-lock-forgot" => {
+                app_lock_sample(app);
+                app.app_lock.forgetting = crate::app_lock::Forgetting::Confirming;
+            }
+            // Settings with a password set and the form to change it open.
+            "app-lock-settings" => {
+                app.settings.app_lock_hash = Some(crate::app_lock::verifier("demo-password"));
+                app.page = Page::Settings;
+                app.settings_search = "app lock".into();
+                app.app_lock.form = Some(crate::app_lock::Form::new(
+                    crate::app_lock::FormMode::Change,
+                ));
+            }
+            "app-lock-setup" => {
+                app.page = Page::Settings;
+                app.settings_search = "app lock".into();
+                let mut form = crate::app_lock::Form::new(crate::app_lock::FormMode::Set);
+                form.new = "short".into();
+                form.error = Some(crate::app_lock::FormError::TooShort);
+                app.app_lock.form = Some(form);
+            }
             "new-chat" => app.dialog = Some(crate::model::Dialog::NewChat),
             "unnamed-group" => {
                 app.typing.clear();
@@ -1650,6 +1835,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         Contact {
                             id: id.clone(),
                             full_name: Some((*name).to_owned()),
+                            first_name: None,
                             push_name: None,
                         },
                     );
@@ -1845,6 +2031,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.settings_search = choice["settings-search=".len()..].to_owned();
             }
             "wallpaper" => app.page = Page::Wallpaper,
+            "wallpaper-image" => wallpaper_image_sample(app),
             "omarchy" | "omarchy-light" => {
                 let mut themes: Vec<_> = crate::theme::presets().collect();
                 let filename = if part == "omarchy-light" {
@@ -1958,6 +2145,23 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
             }
             "info" => {
                 app.dialog = app.open_chat.clone().map(Dialog::ChatInfo);
+            }
+            "group-info" | "group-info-rename" | "group-info-locked" | "group-info-saving" => {
+                // A group whose name and photo we may change, the same with its
+                // name being typed or its change on the way, and one locked for us.
+                let group = if part == "group-info-locked" {
+                    "120363011122233344@g.us"
+                } else {
+                    SAMPLES[1].id
+                };
+                app.open_chat = Some(group.to_owned());
+                app.dialog = Some(Dialog::ChatInfo(group.to_owned()));
+                if part == "group-info-rename" {
+                    app.group_name_edit = Some("Rust Berlin 🦀".to_owned());
+                }
+                if part == "group-info-saving" {
+                    app.group_saving.insert(group.to_owned());
+                }
             }
             "forward" => {
                 app.dialog = app.open_chat.clone().map(|chat| Dialog::Forward {
@@ -2182,6 +2386,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         Content::PhoneOnly {
                             view_once: false,
                             live_location: true,
+                            once: None,
                         },
                     ),
                 ];
@@ -2235,6 +2440,59 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.emoji_start = Some(6);
                 app.emoji_selected = 0;
                 app.focus_composer = true;
+            }
+            // The strips above the composer: a reply, an edit, and a voice
+            // message WhatsApp refused.
+            "reply" => {
+                app.open_chat = Some(SAMPLES[0].id.to_owned());
+                app.reply_to = Some("ada-photo".into());
+                app.focus_composer = true;
+            }
+            "edit" => {
+                let chat = SAMPLES[0].id;
+                app.open_chat = Some(chat.to_owned());
+                let own =
+                    app.conversations.get(chat).and_then(|conversation| {
+                        conversation.messages.iter().rev().find_map(|message| {
+                            match &message.content {
+                                Content::Text { text, .. } if message.from_me => {
+                                    Some((message.id.clone(), text.clone()))
+                                }
+                                _ => None,
+                            }
+                        })
+                    });
+                if let Some((id, text)) = own {
+                    app.composer = text;
+                    app.editing = Some(id);
+                }
+                app.focus_composer = true;
+            }
+            // Reading back through the first chat, away from its end: the
+            // button back to the newest message shows.
+            "scrolled" => {
+                let chat = SAMPLES[0].id;
+                app.open_chat = Some(chat.to_owned());
+                app.scroll_to_bottom = false;
+                app.at_bottom = false;
+                app.scroll_anchor = app
+                    .conversations
+                    .get(chat)
+                    .and_then(|conversation| conversation.messages.get(4))
+                    .map(|message| message.id.clone());
+            }
+            // The group photo with its reactions, and the day above it.
+            "reactions" => {
+                app.open_chat = Some(SAMPLES[1].id.to_owned());
+                app.scroll_to_bottom = false;
+                app.at_bottom = false;
+                app.scroll_anchor = Some("group-photo".into());
+            }
+            "unsent-voice" => {
+                let chat = SAMPLES[0].id;
+                app.open_chat = Some(chat.to_owned());
+                app.unsent_voice =
+                    Some((chat.to_owned(), vec![0.0; crate::voice::RATE as usize * 6]));
             }
             // Show two simultaneous group typers.
             "typers" => {
@@ -2699,17 +2957,25 @@ mod tests {
                 .map(|placed| placed.rect().translate(pos.to_vec2()))
                 .reduce(|a, b| a.union(b))
                 .expect("rows");
+            let row_height = body.rows[0].row.size.y;
+            // A picture may overhang its row: Apple's cell, transparent above
+            // and below the emoji, and Segoe UI Emoji's narrower families,
+            // drawn at their full height, reach up to a tenth of a row past it.
+            let overhang = row_height * 0.1;
             // Only images inside the text are emoji; a wallpaper tile behind
             // the bubble can have its centre there too.
             let emoji: Vec<&egui::Rect> = images
                 .iter()
-                .filter(|image| body_rect.expand(1.0).contains_rect(**image))
+                .filter(|image| {
+                    body_rect
+                        .expand2(egui::vec2(1.0, overhang))
+                        .contains_rect(**image)
+                })
                 .collect();
             let placeholders = body.text().matches(crate::emoji::PLACEHOLDER).count();
             if crate::emoji::available() {
                 assert_eq!(emoji.len(), placeholders, "one bitmap per emoji");
             }
-            let row_height = body.rows[0].row.size.y;
             for image in &emoji {
                 assert!(
                     image.width().max(image.height()) >= row_height,
@@ -2729,8 +2995,9 @@ mod tests {
                         egui::vec2(glyph.advance_width, placed.row.size.y),
                     );
                     for image in &emoji {
+                        // Only a sideways overlap in the same line counts.
                         assert!(
-                            !image.shrink(0.5).intersects(ink),
+                            !image.shrink2(egui::vec2(0.5, overhang)).intersects(ink),
                             "emoji at {image:?} overlaps {:?} at {ink:?}",
                             glyph.chr
                         );
@@ -3777,6 +4044,64 @@ mod tests {
         assert!(!labels.contains(&"admins"));
     }
 
+    /// Every label and value in the accessibility tree of one frame.
+    fn accessible_labels(app: &mut App, ctx: &egui::Context) -> Vec<String> {
+        render(app, ctx);
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1180.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.frame_ui(ui),
+        );
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree")
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_lock_screen_draws_no_chat_name_or_message() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("app-lock"));
+        let labels = accessible_labels(&mut app, &ctx);
+        assert!(labels.iter().any(|label| label == "Unlock"), "{labels:?}");
+        let leaks = |labels: &[String]| -> Vec<String> {
+            SAMPLES
+                .iter()
+                .flat_map(|sample| {
+                    std::iter::once(sample.name).chain(sample.lines.iter().map(|(_, line)| *line))
+                })
+                .filter(|private| labels.iter().any(|label| label.contains(private)))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(leaks(&labels), Vec::<String>::new());
+        assert!(
+            app.copy_rows
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "no message body is drawn for copying"
+        );
+        // The same app unlocked shows them, so the check above means something.
+        app.app_lock.release();
+        let labels = accessible_labels(&mut app, &ctx);
+        assert!(!leaks(&labels).is_empty());
+    }
+
     #[test]
     fn every_surface_lays_out() {
         let mut app = app();
@@ -3791,10 +4116,16 @@ mod tests {
             "chat-menu",
             "chat-header-menu",
             "channel",
+            "meta-ai",
             "locked",
             "locked-open",
             "locked-prompt",
             "locked-setup",
+            "app-lock",
+            "app-lock-wrong",
+            "app-lock-forgot",
+            "app-lock-settings",
+            "app-lock-setup",
             "new-chat",
             "unnamed-group",
             "keyring",
@@ -3814,6 +4145,7 @@ mod tests {
             "message-info-direct",
             "video",
             "video-playing",
+            "video-expanded",
             "shared-contact",
             "note-playing",
             "empty",
@@ -3824,6 +4156,10 @@ mod tests {
             "settings-search=System",
             "wallpaper",
             "wallpaper,light",
+            "wallpaper,wallpaper-image",
+            "wallpaper,wallpaper-image,light",
+            "wallpaper,theme=Nord.json",
+            "wallpaper-image",
             "update",
             "update-downloading",
             "update-ready",
@@ -3846,6 +4182,10 @@ mod tests {
             "about",
             "failed",
             "info",
+            "group-info",
+            "group-info-rename",
+            "group-info-locked",
+            "group-info-saving",
             "forward",
             "unlink",
             "leave-group",
@@ -3888,6 +4228,11 @@ mod tests {
             "composer-tools",
             "mention",
             "emoji-complete",
+            "reply",
+            "edit",
+            "unsent-voice",
+            "scrolled",
+            "reactions",
             "typers",
             "nosidebar",
             "wide",
@@ -4129,6 +4474,126 @@ mod tests {
         }
     }
 
+    /// The group dialog offers the pencil and the photo menu only when we may
+    /// change the group's info, and not while a change is on its way.
+    #[test]
+    fn group_info_offers_editing_only_when_allowed() {
+        use crate::ui::dialogs::{group_name_button_id, group_photo_id};
+        for (page, offered) in [
+            ("group-info", true),
+            ("group-info-locked", false),
+            ("group-info-saving", false),
+        ] {
+            let mut app = app();
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            apply_flags(&mut app, Some(page));
+            render(&mut app, &ctx);
+            let drawn = |id| ctx.data(|data| data.get_temp::<egui::Rect>(id)).is_some();
+            assert_eq!(drawn(group_name_button_id()), offered, "{page}: the pencil");
+            assert_eq!(drawn(group_photo_id()), offered, "{page}: the photo menu");
+        }
+    }
+
+    /// The pencil opens the name editor; Enter renames the group on WhatsApp,
+    /// an unchanged name sends nothing, and Escape cancels without closing the
+    /// dialog. The photo opens its menu.
+    #[test]
+    fn a_group_is_renamed_from_its_info_dialog() {
+        use crate::backend::Command;
+        use crate::ui::dialogs::{group_name_button_id, group_photo_id};
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.backend.record_demo_commands();
+        apply_flags(&mut app, Some("group-info"));
+        render(&mut app, &ctx);
+        let group = SAMPLES[1].id;
+        let click = |app: &mut App, id: egui::Id| {
+            let pos = ctx
+                .data(|data| data.get_temp::<egui::Rect>(id))
+                .expect("the control is on screen")
+                .center();
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(app, &ctx, vec![egui::Event::PointerMoved(pos), press(true)]);
+            frame_with(app, &ctx, vec![press(false)]);
+            render(app, &ctx);
+        };
+        let enter = |app: &mut App| {
+            frame_with(
+                app,
+                &ctx,
+                vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+            );
+            render(app, &ctx);
+            app.backend.take_demo_commands()
+        };
+
+        click(&mut app, group_name_button_id());
+        assert_eq!(app.group_name_edit.as_deref(), Some("Rust Berlin"));
+        // Unchanged: the editor closes and nothing is sent.
+        let sent = enter(&mut app);
+        assert!(app.group_name_edit.is_none());
+        assert!(
+            !sent
+                .iter()
+                .any(|command| matches!(command, Command::SetGroupName { .. })),
+            "an unchanged name is not sent"
+        );
+
+        click(&mut app, group_name_button_id());
+        app.group_name_edit = Some("  Rust Berlin meetups ".into());
+        render(&mut app, &ctx);
+        let sent = enter(&mut app);
+        assert!(
+            sent.iter().any(|command| matches!(command,
+                Command::SetGroupName { chat, name }
+                    if chat == group && name == "Rust Berlin meetups")),
+            "Enter renames the group, trimmed"
+        );
+        assert!(app.group_name_edit.is_none());
+        assert_eq!(
+            app.chat(group).map(|chat| chat.name.as_str()),
+            Some("Rust Berlin"),
+            "the name waits for WhatsApp to accept it"
+        );
+
+        click(&mut app, group_name_button_id());
+        assert!(app.group_name_edit.is_some());
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        render(&mut app, &ctx);
+        assert!(app.group_name_edit.is_none(), "Escape cancels the rename");
+        assert!(
+            matches!(app.dialog, Some(Dialog::ChatInfo(_))),
+            "and keeps the dialog"
+        );
+
+        click(&mut app, group_photo_id());
+        assert!(egui::Popup::is_any_open(&ctx), "the photo opens its menu");
+        app.actions
+            .push(crate::model::Action::RemoveGroupPicture(group.into()));
+        render(&mut app, &ctx);
+        assert!(
+            app.backend
+                .take_demo_commands()
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    Command::SetGroupPicture { chat, jpeg: None } if chat == group
+                )),
+            "Remove photo asks WhatsApp to remove it"
+        );
+    }
+
     #[test]
     fn the_speed_chip_cycles_and_the_menu_offers_every_speed() {
         let mut app = app();
@@ -4288,6 +4753,89 @@ mod tests {
             vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
         );
         assert_eq!(app.composer, "", "Enter sends");
+    }
+
+    #[test]
+    fn clicking_empty_conversation_space_returns_focus_to_the_composer() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let chat = app.open_chat.clone().expect("the demo opens a chat");
+        let conversation = app.conversations.get_mut(&chat).unwrap();
+        conversation.messages.clear();
+        conversation.complete = true;
+        conversation.phone_exhausted = true;
+        app.focus_composer = true;
+        render(&mut app, &ctx);
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("composer-text"))));
+
+        let viewport = app
+            .selection_view
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("the message viewport is on screen");
+        let at = viewport.center();
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(at), pointer(true), pointer(false)],
+        );
+        render(&mut app, &ctx);
+
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("composer-text"))));
+    }
+
+    /// Most empty space in a chat is the strip beside a bubble, which takes
+    /// clicks before the background does; a click there refocuses too.
+    #[test]
+    fn clicking_beside_a_message_returns_focus_to_the_composer() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let chat = app.open_chat.clone().expect("the demo opens a chat");
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        let viewport = app
+            .selection_view
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("the message viewport is on screen");
+        let bubble = app.conversations[&chat]
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| {
+                let id = crate::ui::conversation::bubble_id(&chat, &message.id).with("rect");
+                let rect = ctx.data(|data| data.get_temp::<egui::Rect>(id))?;
+                (viewport.contains_rect(rect) && rect.right() < viewport.right() - 60.0)
+                    .then_some(rect)
+            })
+            .expect("an incoming bubble with room beside it");
+        let composer = egui::Id::new("composer-text");
+        ctx.memory_mut(|memory| memory.surrender_focus(composer));
+        render(&mut app, &ctx);
+        assert!(!ctx.memory(|memory| memory.has_focus(composer)));
+
+        let at = egui::pos2(viewport.right() - 20.0, bubble.center().y);
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(at), pointer(true), pointer(false)],
+        );
+        render(&mut app, &ctx);
+        assert!(ctx.memory(|memory| memory.has_focus(composer)));
     }
 
     /// The composer keeps its draft while the preview is open: Enter does not
@@ -4851,6 +5399,68 @@ mod tests {
     }
 
     #[test]
+    fn arrows_pick_a_chat_search_result_and_enter_opens_it_for_typing() {
+        let mut app = app();
+        let mut first = Chat::new(
+            "491700009001@s.whatsapp.net".into(),
+            "Forsaken Alpha".into(),
+        );
+        first.last_activity = 2_000_000_000;
+        let mut second = Chat::new("491700009002@s.whatsapp.net".into(), "Forsaken Beta".into());
+        second.last_activity = first.last_activity - 1;
+        app.chats.extend([first, second]);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::K, egui::Modifiers::COMMAND)],
+        );
+        render(&mut app, &ctx);
+        frame_with(&mut app, &ctx, vec![egui::Event::Text("Forsaken".into())]);
+        assert_eq!(app.search, "Forsaken");
+
+        let matches: Vec<_> = app
+            .visible_chats()
+            .into_iter()
+            .map(|chat| chat.id.clone())
+            .collect();
+        assert_eq!(matches.len(), 2, "only the two fixtures match");
+        // Shift+↓ keeps selecting text in the field.
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::SHIFT)],
+        );
+        assert_eq!(app.search_selected, None);
+
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.search_selected.as_ref(), matches.first());
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.search_selected.as_ref(), matches.get(1));
+
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        render(&mut app, &ctx);
+
+        assert_eq!(app.open_chat.as_ref(), matches.get(1));
+        assert!(app.search.is_empty());
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("composer-text"))));
+    }
+
+    #[test]
     fn at_sign_selects_a_group_member_without_leaving_the_composer() {
         let mut app = app();
         let ctx = egui::Context::default();
@@ -4907,6 +5517,47 @@ mod tests {
         );
         render(&mut app, &ctx);
         assert!(egui::Popup::is_id_open(&ctx, popup), "and it stays open");
+    }
+
+    /// #240: a right-click in the empty strip beside a bubble opens that
+    /// message's menu, on either side of the chat.
+    #[test]
+    fn right_click_beside_a_message_opens_its_menu() {
+        let chat = sample_ids()[0].to_owned();
+        for (message, own) in [("ada-voice", false), ("ada-doc", true)] {
+            let mut app = app();
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            for _ in 0..3 {
+                render(&mut app, &ctx);
+            }
+            let id = crate::ui::conversation::bubble_id(&chat, message);
+            let rect = ctx
+                .data(|data| data.get_temp::<egui::Rect>(id.with("rect")))
+                .unwrap_or_else(|| panic!("{message} is on screen"));
+            let beside = if own {
+                egui::pos2(rect.left() - 60.0, rect.center().y)
+            } else {
+                egui::pos2(rect.right() + 60.0, rect.center().y)
+            };
+            let button = |pressed| egui::Event::PointerButton {
+                pos: beside,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(beside), button(true)],
+            );
+            frame_with(&mut app, &ctx, vec![button(false)]);
+            render(&mut app, &ctx);
+            assert!(
+                egui::Popup::is_id_open(&ctx, id.with("popup")),
+                "a right-click beside {message} opens its menu"
+            );
+        }
     }
 
     #[test]
@@ -4981,6 +5632,293 @@ mod tests {
         frame_with(&mut app, &ctx, Vec::new());
         assert_eq!(selected(&app), None, "Escape ends the selection");
         assert_eq!(app.open_chat, Some(chat), "and leaves the chat open");
+    }
+
+    /// A chat of `count` short text messages, alternating sides from an
+    /// outgoing first one, opened and drawn at its end.
+    fn sweep_chat(count: u32) -> (App, egui::Context, String) {
+        let mut app = app();
+        let chat = sample_ids()[0].to_owned();
+        app.conversations.get_mut(&chat).unwrap().messages = (0..count)
+            .map(|i| {
+                message(
+                    &chat,
+                    &format!("m{i:03}"),
+                    i % 2 == 0,
+                    1_700_000_000 + i64::from(i),
+                    Content::text(format!("message number {i}")),
+                )
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        (app, ctx, chat)
+    }
+
+    fn drawn_rect(ctx: &egui::Context, chat: &str, message: &str, part: &str) -> egui::Rect {
+        let id = crate::ui::conversation::bubble_id(chat, message).with(part);
+        ctx.data(|data| data.get_temp::<egui::Rect>(id))
+            .unwrap_or_else(|| panic!("{message} is on screen"))
+    }
+
+    /// A point in the empty strip beside a message's bubble.
+    fn beside(ctx: &egui::Context, chat: &str, message: &str, from_me: bool) -> egui::Pos2 {
+        let rect = drawn_rect(ctx, chat, message, "rect");
+        let x = if from_me {
+            rect.left() - 100.0
+        } else {
+            rect.right() + 100.0
+        };
+        // Where the strip took input last, which a history still settling
+        // may have moved from the bubble's last rect.
+        let row = ctx
+            .read_response(crate::ui::conversation::bubble_id(chat, message).with("row"))
+            .map_or(rect, |row| row.rect);
+        egui::pos2(x, row.center().y)
+    }
+
+    fn selected_ids(app: &App) -> Vec<String> {
+        app.selection
+            .as_ref()
+            .map(|(_, ids)| ids.clone())
+            .unwrap_or_default()
+    }
+
+    fn text_selected(ctx: &egui::Context) -> bool {
+        ctx.plugin_opt::<egui::text_selection::LabelSelectionState>()
+            .is_some_and(|plugin| plugin.lock().has_selection())
+    }
+
+    /// #246: while selecting, a drag over messages sweeps them into the
+    /// selection, text included, and dragging back leaves rows out again.
+    #[test]
+    fn a_drag_while_selecting_sweeps_messages_over_their_text() {
+        let (mut app, ctx, chat) = sweep_chat(8);
+        app.actions
+            .push(crate::model::Action::SelectMessage("m001".into()));
+        render(&mut app, &ctx);
+        let body = |id: &str| drawn_rect(&ctx, &chat, id, "body").center();
+        let (from, via, to) = (body("m003"), body("m004"), body("m005"));
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(from), primary(from, true)],
+        );
+        for pos in [via, to, to] {
+            frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+        }
+        assert_eq!(
+            selected_ids(&app),
+            ["m001", "m003", "m004", "m005"],
+            "the sweep adds every row from the press to the pointer"
+        );
+        assert!(!text_selected(&ctx), "the drag swept messages, not text");
+        // Back over the row it began on: the rows passed again drop out.
+        for _ in 0..2 {
+            frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(from)]);
+        }
+        assert_eq!(selected_ids(&app), ["m001", "m003"]);
+        frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(via)]);
+        frame_with(&mut app, &ctx, vec![primary(via, false)]);
+        render(&mut app, &ctx);
+        assert_eq!(selected_ids(&app), ["m001", "m003", "m004"]);
+        assert!(app.sweep.is_none(), "releasing ends the sweep");
+        // Moving without the button does not sweep further.
+        frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(to)]);
+        render(&mut app, &ctx);
+        assert_eq!(selected_ids(&app), ["m001", "m003", "m004"]);
+        // A click still toggles, and Shift-click still takes a range.
+        let click = |app: &mut App, pos: egui::Pos2, modifiers: egui::Modifiers| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers,
+            };
+            frame_with(
+                app,
+                &ctx,
+                vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::PointerMoved(pos),
+                    button(true),
+                ],
+            );
+            frame_with(app, &ctx, vec![button(false)]);
+            frame_with(
+                app,
+                &ctx,
+                vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+            );
+            render(app, &ctx);
+        };
+        click(&mut app, body("m003"), egui::Modifiers::NONE);
+        assert_eq!(selected_ids(&app), ["m001", "m004"]);
+        click(&mut app, body("m006"), egui::Modifiers::SHIFT);
+        // From the message clicked last, as before.
+        assert_eq!(selected_ids(&app), ["m001", "m003", "m004", "m005", "m006"]);
+    }
+
+    /// #246: outside selection mode, a drag that starts beside the bubbles,
+    /// off the text, starts selecting and sweeps the messages it passes. A
+    /// drag over the text still selects the text.
+    #[test]
+    fn a_drag_beside_the_bubbles_starts_selecting_messages() {
+        let (mut app, ctx, chat) = sweep_chat(8);
+        // Over the text, a drag selects text as before.
+        let text = drawn_rect(&ctx, &chat, "m002", "body");
+        let (start, end) = (
+            egui::pos2(text.left() + 2.0, text.center().y),
+            text.center(),
+        );
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), primary(start, true)],
+        );
+        frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        frame_with(&mut app, &ctx, vec![primary(end, false)]);
+        assert!(text_selected(&ctx), "the drag over the text selects text");
+        assert!(app.selection.is_none(), "and no messages");
+        render(&mut app, &ctx);
+        // Beside the bubbles, it sweeps messages instead.
+        let from = beside(&ctx, &chat, "m003", false);
+        let to = beside(&ctx, &chat, "m005", false);
+        let via = beside(&ctx, &chat, "m004", true);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(from), primary(from, true)],
+        );
+        for pos in [via, to, to] {
+            frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+        }
+        frame_with(&mut app, &ctx, vec![primary(to, false)]);
+        render(&mut app, &ctx);
+        assert_eq!(selected_ids(&app), ["m003", "m004", "m005"]);
+        assert!(app.sweep.is_none());
+        // A click beside a bubble in selection mode still toggles it.
+        let pos = beside(&ctx, &chat, "m004", true);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pos), primary(pos, true)],
+        );
+        frame_with(&mut app, &ctx, vec![primary(pos, false)]);
+        render(&mut app, &ctx);
+        assert_eq!(selected_ids(&app), ["m003", "m005"]);
+    }
+
+    /// #246: a sweep held at the top edge scrolls the list, and takes every
+    /// message it passes, rows the list only estimated included.
+    #[test]
+    fn a_sweep_held_at_the_top_edge_scrolls_and_selects_what_it_passes() {
+        let (mut app, ctx, chat) = sweep_chat(400);
+        // Let the rows measured for the first time settle.
+        let mut last = None;
+        for _ in 0..20 {
+            render(&mut app, &ctx);
+            let rect = drawn_rect(&ctx, &chat, "m398", "rect");
+            if last == Some(rect) {
+                break;
+            }
+            last = Some(rect);
+        }
+        let view = app
+            .selection_view
+            .lock()
+            .expect("the view rect")
+            .expect("the conversation was drawn");
+        let on_screen = (0..400)
+            .filter(|i| {
+                let id = crate::ui::conversation::bubble_id(&chat, &format!("m{i:03}"));
+                ctx.data(|data| data.get_temp::<egui::Rect>(id.with("rect")))
+                    .is_some_and(|rect| view.intersects(rect))
+            })
+            .count();
+        let from = beside(&ctx, &chat, "m398", true);
+        let hold = egui::pos2(from.x, view.top() + 4.0);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(from), primary(from, true)],
+        );
+        for _ in 0..120 {
+            frame_with(&mut app, &ctx, vec![egui::Event::PointerMoved(hold)]);
+        }
+        frame_with(&mut app, &ctx, vec![primary(hold, false)]);
+        render(&mut app, &ctx);
+        let ids = selected_ids(&app);
+        assert_eq!(ids.last().map(String::as_str), Some("m398"), "{ids:?}");
+        assert!(
+            ids.len() > on_screen + 5,
+            "the sweep scrolled past the first screen: {} of {on_screen}",
+            ids.len()
+        );
+        // Every message between its ends, in order, with none left out.
+        let first: usize = ids[0][1..].parse().expect("a numbered id");
+        let expected: Vec<String> = (first..=398).map(|i| format!("m{i:03}")).collect();
+        assert_eq!(ids, expected);
+        assert!(!app.scroll_to_bottom, "heading up releases the pin");
+    }
+
+    /// #241: while selecting, a click on a message's text or beside its
+    /// bubble adds it, not only a click on the bubble's padding.
+    #[test]
+    fn while_selecting_a_click_on_the_text_or_beside_it_selects() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        for _ in 0..3 {
+            render(&mut app, &ctx);
+        }
+        let chat = sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::SelectMessage("ada-doc".into()));
+        render(&mut app, &ctx);
+        let rect = |message: &str, part: &str| {
+            let id = crate::ui::conversation::bubble_id(&chat, message).with(part);
+            ctx.data(|data| data.get_temp::<egui::Rect>(id))
+                .unwrap_or_else(|| panic!("{message} is on screen"))
+        };
+        let click = |app: &mut App, pos: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(
+                app,
+                &ctx,
+                vec![egui::Event::PointerMoved(pos), button(true)],
+            );
+            frame_with(app, &ctx, vec![button(false)]);
+            render(app, &ctx);
+        };
+        let selected = |app: &App| {
+            app.selection
+                .as_ref()
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default()
+        };
+        // The middle of the text, where the body takes clicks and drags.
+        click(&mut app, rect("ada-reply", "body").center());
+        assert_eq!(selected(&app), ["ada-doc", "ada-reply"], "the text selects");
+        // The empty strip to the right of an incoming bubble.
+        let voice = rect("ada-voice", "rect");
+        click(&mut app, egui::pos2(voice.right() + 60.0, voice.center().y));
+        assert_eq!(
+            selected(&app),
+            ["ada-doc", "ada-voice", "ada-reply"],
+            "the strip beside the bubble selects"
+        );
+        // And a second click on the text leaves the message out again.
+        click(&mut app, rect("ada-reply", "body").center());
+        assert_eq!(selected(&app), ["ada-doc", "ada-voice"]);
     }
 
     /// One frame with AccessKit on; returns (label, role, centre) per node.
@@ -5067,6 +6005,91 @@ mod tests {
         };
         click(&mut app, copy);
         assert!(app.toasts.iter().any(|toast| toast.message == "Copied"));
+    }
+
+    /// Opening the log hands it to the worker, which waits to see it open or
+    /// shows it in its folder, instead of the fire-and-forget attachment path
+    /// that opened nothing on Linux desktops without a handler for it.
+    #[test]
+    fn opening_the_log_goes_through_the_checked_opener() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.attach(&ctx);
+        app.backend.record_demo_commands();
+        let log = app.dirs.log_file();
+        app.actions.push(crate::model::Action::OpenLog(log.clone()));
+        render(&mut app, &ctx);
+        assert!(
+            app.backend
+                .take_demo_commands()
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    crate::backend::Command::OpenLog(path) if path == &log
+                ))
+        );
+    }
+
+    /// A downloaded image's menu copies the picture itself, as the preview
+    /// does; one that is not downloaded yet offers no copy.
+    #[test]
+    fn the_menu_of_a_downloaded_image_copies_it() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let chat = sample_ids()[0].to_owned();
+        let path = std::path::PathBuf::from("demo/photo.jpg");
+        for downloaded in [true, false] {
+            let mut app = app();
+            app.attach(&ctx);
+            app.backend.record_demo_commands();
+            let mut photo = media("image/jpeg", 120_000, Some(800), Some(600));
+            photo.path = downloaded.then(|| path.clone());
+            app.conversations.get_mut(&chat).unwrap().messages = vec![message(
+                &chat,
+                "copy-photo",
+                false,
+                100,
+                Content::Image {
+                    caption: None,
+                    media: photo,
+                },
+            )];
+            app.open_message_menu = Some("copy-photo".into());
+            render(&mut app, &ctx);
+            let nodes = accessible_nodes(&mut app, &ctx, Vec::new());
+            let copy = nodes
+                .iter()
+                .find(|(label, _, _)| label == "Copy image")
+                .map(|(_, _, pos)| *pos);
+            assert_eq!(
+                copy.is_some(),
+                downloaded,
+                "Copy image only when downloaded"
+            );
+            let Some(pos) = copy else { continue };
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            accessible_nodes(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(pos), press(true)],
+            );
+            accessible_nodes(&mut app, &ctx, vec![press(false)]);
+            assert!(
+                app.backend
+                    .take_demo_commands()
+                    .iter()
+                    .any(|command| matches!(
+                        command,
+                        crate::backend::Command::PrepareClipboardImage(copied) if copied == &path
+                    )),
+                "the image goes to the clipboard"
+            );
+        }
     }
 
     #[test]
@@ -5993,6 +7016,59 @@ mod tests {
                 );
             } else {
                 assert!(row.is_none(), "{page}: a local delete removes the row");
+            }
+        }
+    }
+
+    /// Alt+Up/Down and Ctrl+Shift+[ ] switch chats while the question is up.
+    /// Confirming afterwards must still delete in the chat the message came
+    /// from, not in whichever chat is open by then.
+    #[test]
+    fn a_message_deletion_confirmed_after_switching_chats_stays_in_its_chat() {
+        let own_chat = SAMPLES[0].id;
+        for (page, message, everyone) in [
+            ("delete-message", "ada-emoji", true),
+            ("delete-message-mine", "ada-format", false),
+        ] {
+            let mut app = app();
+            apply_flags(&mut app, Some(page));
+            app.open_chat = Some(SAMPLES[1].id.to_owned());
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            app.attach(&ctx);
+            render(&mut app, &ctx);
+
+            let pos = accessible_nodes(&mut app, &ctx, Vec::new())
+                .into_iter()
+                .find(|(label, role, _)| {
+                    label == "Delete" && *role == egui::accesskit::Role::Button
+                })
+                .map(|(_, _, centre)| centre)
+                .expect("the confirm button is on screen");
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(pos), press(true)],
+            );
+            frame_with(&mut app, &ctx, vec![press(false)]);
+
+            let row = app.conversations[own_chat].message(message);
+            if everyone {
+                assert!(
+                    matches!(
+                        row.map(|message| &message.content),
+                        Some(crate::model::Content::Revoked)
+                    ),
+                    "{page}: the message is revoked in its own chat"
+                );
+            } else {
+                assert!(row.is_none(), "{page}: the message leaves its own chat");
             }
         }
     }
@@ -6938,6 +8014,153 @@ mod tests {
         assert!(!copied.trim().is_empty(), "{copied:?}");
     }
 
+    /// Seeding a selection turns on full layout for the virtualized row
+    /// list, renumbering every positional widget id under the pressed row.
+    /// The press's own row must stay addressable or egui drops the
+    /// selection it just created.
+    #[test]
+    fn message_text_selects_with_virtualized_rows() {
+        let mut app = app();
+        let chat = sample_ids()[0].to_owned();
+        // A history taller than the nearby-row margin puts the earliest
+        // messages in placeholder rows, so the first selection flips the
+        // layout mode while the drag is already under way.
+        app.conversations.get_mut(&chat).unwrap().messages = (0..400)
+            .map(|i| {
+                message(
+                    &chat,
+                    &format!("m{i:03}"),
+                    i % 3 == 0,
+                    1_700_000_000 + i64::from(i),
+                    Content::text(format!("message number {i}")),
+                )
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        // The end-pinned list shows the newest message: press it, sweep
+        // across the text, and copy the result.
+        let key = crate::ui::conversation::bubble_id(&chat, "m399").with("body");
+        let body = ctx
+            .data(|data| data.get_temp::<egui::Rect>(key))
+            .expect("the newest message is on screen");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1180.0, 780.0));
+        assert!(screen.contains_rect(body), "m399 body on screen: {body:?}");
+        let from = egui::pos2(body.left() + 2.0, body.center().y);
+        let to = egui::pos2(body.center().x, body.center().y);
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut copied = None;
+        for events in [
+            vec![egui::Event::PointerMoved(from), press(from, true)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![press(to, false)],
+            vec![egui::Event::Copy],
+            vec![],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                app.background_frame(&ctx);
+                app.frame_ui(ui);
+            });
+            output.textures_delta.clear();
+            for command in output.platform_output.commands {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    copied = Some(text);
+                }
+            }
+        }
+        let copied = copied.expect("the sweep put text on the clipboard");
+        assert!(copied.contains("number 39"), "{copied:?}");
+        // The sweep stays inside one short line. A selection that silently
+        // re-anchors to another row copies every row it lands across.
+        assert!(!copied.contains('\n'), "{copied:?}");
+    }
+
+    /// A sweep across messages in a long history copies each of them (#269),
+    /// and a row the list stopped laying out keeps no body rect, so the
+    /// selection tests never aim at where it used to be.
+    #[test]
+    fn a_copy_across_messages_survives_rows_skipped_above() {
+        let mut app = app();
+        let chat = sample_ids()[0].to_owned();
+        app.conversations.get_mut(&chat).unwrap().messages = (0..400)
+            .map(|i| {
+                message(
+                    &chat,
+                    &format!("m{i:03}"),
+                    i % 3 == 0,
+                    1_700_000_000 + i64::from(i),
+                    Content::text(format!("message number {i}")),
+                )
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        let body = |id: &str| {
+            let key = crate::ui::conversation::bubble_id(&chat, id).with("body");
+            ctx.data(|data| data.get_temp::<egui::Rect>(key))
+        };
+        assert!(body("m000").is_none(), "{:?}", body("m000"));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1180.0, 780.0));
+        let first = body("m397").expect("m397 on screen");
+        let last = body("m399").expect("m399 on screen");
+        assert!(screen.contains_rect(first) && screen.contains_rect(last));
+        let from = egui::pos2(first.left() + 2.0, first.center().y);
+        let to = last.center();
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut copied = None;
+        for events in [
+            vec![egui::Event::PointerMoved(from), press(from, true)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![press(to, false)],
+            vec![egui::Event::Copy],
+            vec![],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                app.background_frame(&ctx);
+                app.frame_ui(ui);
+            });
+            output.textures_delta.clear();
+            for command in output.platform_output.commands {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    copied = Some(text);
+                }
+            }
+        }
+        let copied = copied.expect("the sweep put text on the clipboard");
+        for number in ["number 397", "number 398", "number 39"] {
+            assert!(copied.contains(number), "{number}: {copied:?}");
+        }
+        assert_eq!(copied.matches("] ").count(), 3, "{copied:?}");
+    }
+
     #[test]
     fn a_drag_selects_short_messages_on_opposite_sides_of_the_chat() {
         let mut app = app();
@@ -7652,6 +8875,52 @@ mod tests {
     }
 
     #[test]
+    fn a_quote_names_the_people_its_text_mentions() {
+        let mut app = app();
+        apply_flags(&mut app, Some("quotes"));
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = frame_sized(&mut app, &ctx, 780.0, Vec::new());
+        }
+        let quote = app.conversations[SAMPLES[1].id]
+            .messages
+            .iter()
+            .find(|row| row.id == "quote-own")
+            .and_then(|row| row.quoted.clone())
+            .expect("a quote");
+        let mention = quote.mentions.first().expect("the quote mentions Jonas");
+        assert!(quote.summary.contains(&format!("@{}", mention.user)));
+        let named = format!("@{} will do", app.mention_name(&mention.id));
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, out)),
+                _ => {}
+            }
+        }
+        let mut drawn = Vec::new();
+        for clipped in &shapes {
+            texts(&clipped.shape, &mut drawn);
+        }
+        let quotes: Vec<_> = drawn
+            .iter()
+            .filter(|text| text.contains("will do"))
+            .collect();
+        assert!(
+            quotes.iter().any(|text| text.starts_with(&named)),
+            "{named:?} not among {quotes:?}"
+        );
+        assert!(
+            quotes
+                .iter()
+                .all(|text| !text.contains(&format!("@{}", mention.user))),
+            "a raw number is drawn: {quotes:?}"
+        );
+    }
+
+    #[test]
     fn a_quote_bar_takes_the_quoted_senders_colour() {
         let mut app = app();
         apply_flags(&mut app, Some("quotes"));
@@ -7956,6 +9225,7 @@ mod tests {
             Contact {
                 id: sender.into(),
                 full_name: Some("Alex Fixture".into()),
+                first_name: None,
                 push_name: None,
             },
         );
@@ -7997,6 +9267,304 @@ mod tests {
             app.composer_tools_open,
             "Enter opens the composer tools menu"
         );
+    }
+
+    /// A draft sits as far below the field's top as above its bottom: the
+    /// span from the capitals' top to the descenders' bottom centres on the
+    /// plus and emoji buttons at every scale. Centring the line box left
+    /// typed text two points high at 133%; centring the capitals alone left
+    /// it low, since descenders reach further down than accents rise.
+    #[test]
+    fn the_composers_text_centres_on_its_controls_at_every_scale() {
+        use crate::ui::focus::Stop;
+        const DRAFT: &str = "Hy";
+        for scale in [1.0_f32, 1.25, 1.333_333, 1.5, 2.0] {
+            let mut app = app();
+            app.composer = DRAFT.into();
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            let mut shapes = Vec::new();
+            for _ in 0..4 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1180.0, 780.0),
+                    )),
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .entry(egui::ViewportId::ROOT)
+                    .or_default()
+                    .native_pixels_per_point = Some(scale);
+                let mut output = ctx.run_ui(input, |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.background_frame(&ctx);
+                    app.frame_ui(ui);
+                });
+                output.textures_delta.clear();
+                shapes = output.shapes;
+            }
+            assert!((ctx.pixels_per_point() - scale).abs() < 1e-4);
+            let id = crate::ui::focus::stops(&ctx)
+                .into_iter()
+                .find(|(found, _)| *found == Stop::Attach)
+                .map(|(_, id)| id)
+                .expect("the plus is drawn");
+            let control = ctx.read_response(id).unwrap().rect.center().y;
+            let mut ink: Option<(f32, f32)> = None;
+            let mut stack: Vec<&egui::Shape> =
+                shapes.iter().map(|clipped| &clipped.shape).collect();
+            while let Some(shape) = stack.pop() {
+                match shape {
+                    egui::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+                    egui::Shape::Text(text) if text.galley.text() == DRAFT => {
+                        for row in &text.galley.rows {
+                            for glyph in row
+                                .glyphs
+                                .iter()
+                                .filter(|glyph| !glyph.uv_rect.is_nothing())
+                            {
+                                let top =
+                                    text.pos.y + row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+                                let bottom = top + glyph.uv_rect.size.y;
+                                ink =
+                                    Some(ink.map_or((top, bottom), |(t, b)| {
+                                        (t.min(top), b.max(bottom))
+                                    }));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let (top, bottom) = ink.expect("the draft is painted");
+            let middle = (top + bottom) / 2.0;
+            // Within a physical pixel, plus rounding: snapping to the grid
+            // may cost up to one, and macOS positions glyphs unhinted.
+            assert!(
+                (middle - control).abs() <= 1.0 / scale + 0.05,
+                "at {scale}x the text centres on {middle}, the controls on {control}"
+            );
+        }
+    }
+
+    /// The theme row links to the website's guide to writing a theme.
+    #[test]
+    fn the_theme_row_opens_the_guide_to_making_a_theme() {
+        let mut app = app();
+        app.page = crate::model::Page::Settings;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        let nodes = accessible_nodes(&mut app, &ctx, Vec::new());
+        let pos = nodes
+            .into_iter()
+            .find(|(label, role, _)| {
+                label == "How to make a theme" && *role == egui::accesskit::Role::Button
+            })
+            .map(|(_, _, centre)| centre)
+            .expect("the guide button is on the Settings page");
+        let mut opened = Vec::new();
+        for pressed in [true, false] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1180.0, 780.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.background_frame(&ctx);
+                    app.frame_ui(ui);
+                },
+            );
+            output.textures_delta.clear();
+            opened.extend(
+                output
+                    .platform_output
+                    .commands
+                    .into_iter()
+                    .filter_map(|command| match command {
+                        egui::OutputCommand::OpenUrl(open) => Some(open.url),
+                        _ => None,
+                    }),
+            );
+        }
+        assert_eq!(opened, ["https://zapfast.rocks/themes/"]);
+    }
+
+    /// The chat list is one clickable surface: each row starts where the one
+    /// above ends, with no gap or rule between them.
+    #[test]
+    fn chat_rows_touch_with_no_gap_between_them() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        let rects: Vec<egui::Rect> = app
+            .visible_chats()
+            .iter()
+            .filter_map(|chat| {
+                ctx.data(|data| {
+                    data.get_temp::<egui::Rect>(crate::ui::chats::chat_row_id(&chat.id))
+                })
+            })
+            .collect();
+        assert!(rects.len() >= 3, "several rows are on screen");
+        for pair in rects.windows(2) {
+            assert!(
+                (pair[1].top() - pair[0].bottom()).abs() < 0.01,
+                "a gap between rows: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// A reply strip sits right on the composer it belongs to.
+    #[test]
+    fn the_reply_strip_sits_close_above_the_composer() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        let chat = app.open_chat.clone().expect("a chat is open");
+        app.reply_to = app
+            .conversations
+            .get(&chat)
+            .and_then(|conversation| conversation.messages.last())
+            .map(|message| message.id.clone());
+        for _ in 0..4 {
+            frame_sized(&mut app, &ctx, 780.0, Vec::new());
+        }
+        let (strip, pill) = ctx.data(|data| {
+            (
+                data.get_temp::<egui::Rect>(crate::ui::conversation::reply_strip_id()),
+                data.get_temp::<egui::Rect>(crate::ui::conversation::composer_pill_id()),
+            )
+        });
+        let (strip, pill) = (
+            strip.expect("the strip is drawn"),
+            pill.expect("the composer"),
+        );
+        let gap = pill.top() - strip.bottom();
+        assert!(
+            (gap - crate::ui::conversation::STRIP_GAP).abs() < 0.5,
+            "the strip ends {gap} above the composer"
+        );
+    }
+
+    /// The emoji and @mention suggestion lists sit on the composer as the
+    /// strips do: as wide as it, and a strip's gap above it.
+    #[test]
+    fn suggestion_lists_sit_close_above_the_composer() {
+        for page in ["emoji-complete", "mention"] {
+            let mut app = app();
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            apply_flags(&mut app, Some(page));
+            for _ in 0..4 {
+                frame_sized(&mut app, &ctx, 780.0, Vec::new());
+            }
+            let (list, pill) = ctx.data(|data| {
+                (
+                    data.get_temp::<egui::Rect>(crate::ui::conversation::suggestion_list_id()),
+                    data.get_temp::<egui::Rect>(crate::ui::conversation::composer_pill_id()),
+                )
+            });
+            let (list, pill) = (
+                list.expect("the list is drawn"),
+                pill.expect("the composer"),
+            );
+            let gap = pill.top() - list.bottom();
+            assert!(
+                (gap - crate::ui::conversation::STRIP_GAP).abs() < 0.5,
+                "{page}: the list ends {gap} above the composer"
+            );
+            assert!(
+                (list.left() - pill.left()).abs() < 0.5
+                    && (list.right() - pill.right()).abs() < 0.5,
+                "{page}: the list {list:?} spans the composer {pill:?}"
+            );
+        }
+    }
+
+    /// The chat list's header and the conversation's start their first row
+    /// at the same height and make it as tall, so the titles line up, in the
+    /// macOS layout (no title bar, traffic lights on the row) as elsewhere.
+    #[test]
+    fn both_headers_share_their_first_row() {
+        for macos in [false, true] {
+            let mut app = app();
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            if macos {
+                crate::theme::preview_macos(&ctx);
+            }
+            for _ in 0..3 {
+                frame_sized(&mut app, &ctx, 780.0, Vec::new());
+            }
+            let (list, chat) = ctx.data(|data| {
+                (
+                    data.get_temp::<egui::Rect>(crate::ui::chats::header_row_id()),
+                    data.get_temp::<egui::Rect>(crate::ui::conversation::header_row_id()),
+                )
+            });
+            let (list, chat) = (
+                list.expect("the chat list"),
+                chat.expect("the conversation"),
+            );
+            assert!(
+                (list.top() - chat.top()).abs() < 0.5
+                    && (list.height() - chat.height()).abs() < 0.5,
+                "macOS {macos}: chat list row {list:?}, conversation row {chat:?}"
+            );
+        }
+    }
+
+    /// The text starts right after the plus and emoji pair, as close to the
+    /// emoji as the emoji is to the plus, not a field's width away.
+    #[test]
+    fn the_composers_text_follows_the_emoji_button_closely() {
+        use crate::ui::focus::Stop;
+        for draft in ["", "A synthetic draft"] {
+            let mut app = app();
+            app.composer = draft.into();
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            for _ in 0..4 {
+                frame_sized(&mut app, &ctx, 780.0, Vec::new());
+            }
+            let emoji = crate::ui::focus::stops(&ctx)
+                .into_iter()
+                .find(|(found, _)| *found == Stop::Emoji)
+                .and_then(|(_, id)| ctx.read_response(id))
+                .expect("the emoji button is drawn")
+                .rect;
+            let text = ctx
+                .read_response(egui::Id::new("composer-text"))
+                .expect("the field is drawn")
+                .rect;
+            let gap = text.left() - emoji.right();
+            assert!(
+                (gap - crate::ui::conversation::COMPOSER_TEXT_GAP).abs() < 0.5,
+                "{draft:?}: the text starts {gap} after the emoji button"
+            );
+        }
     }
 
     /// Plus, emoji, the first line of text and send or record share the
@@ -8041,10 +9609,11 @@ mod tests {
             render(&mut app, &ctx);
             let (pill, text, controls) = measure(&mut app, &ctx);
             let middle = pill.center().y;
+            // The text's ink, not its line box, centres on the field: see
+            // `the_composers_text_centres_on_its_controls_at_every_scale`.
             assert!(
-                (text.center().y - middle).abs() <= 1.0,
-                "text {} vs field {middle} ({draft:?})",
-                text.center().y
+                pill.contains_rect(text),
+                "text {text:?} leaves the field {pill:?}"
             );
             for (stop, y) in [Stop::Attach, Stop::Emoji, Stop::Send].iter().zip(controls) {
                 assert!(
@@ -8064,8 +9633,13 @@ mod tests {
         assert!(pill.height() > 70.0, "the field grew: {pill:?}");
         let line = text.height() / 3.0;
         let last = text.bottom() - line / 2.0;
+        // The last line's ink centres on the controls, which puts its line box
+        // up to a couple of points higher (Inter's box is roomier above).
         for (stop, y) in [Stop::Attach, Stop::Emoji, Stop::Send].iter().zip(controls) {
-            assert!((y - last).abs() <= 1.0, "{stop:?} {y} vs last line {last}");
+            assert!(
+                (0.0..=2.5).contains(&(y - last)),
+                "{stop:?} {y} vs last line {last}"
+            );
         }
     }
 
@@ -8649,6 +10223,92 @@ mod tests {
         assert_eq!(app.dialog, Some(crate::model::Dialog::Shortcuts));
     }
 
+    /// Sending from the emoji picker's Recent row leaves the row in its
+    /// order until the picker opens again, so the same emoji can be sent
+    /// twice from where it was (#294).
+    #[test]
+    fn recent_emoji_keep_their_order_while_the_picker_is_open() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.settings.recent_emoji = vec!["😀".into(), "❤️".into()];
+        apply_flags(&mut app, Some("picker"));
+        render(&mut app, &ctx);
+        assert_eq!(app.picker_recent, Some(vec!["😀".into(), "❤️".into()]));
+        app.actions
+            .push(crate::model::Action::InsertEmoji("❤️".into()));
+        render(&mut app, &ctx);
+        assert_eq!(app.settings.recent_emoji[0], "❤️", "remembered at once");
+        assert_eq!(
+            app.picker_recent,
+            Some(vec!["😀".into(), "❤️".into()]),
+            "shown as it was"
+        );
+        app.picker = None;
+        render(&mut app, &ctx);
+        assert_eq!(app.picker_recent, None);
+        apply_flags(&mut app, Some("picker"));
+        render(&mut app, &ctx);
+        assert_eq!(
+            app.picker_recent.as_ref().map(|recent| recent[0].as_str()),
+            Some("❤️")
+        );
+    }
+
+    /// The About dialog shows the mark the app ships, rendered at its pixel
+    /// size from the packaged SVG, not a disc drawn in the theme's colours.
+    #[test]
+    fn about_shows_the_shipped_mark() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.dialog = Some(crate::model::Dialog::About);
+        render(&mut app, &ctx);
+        let texture = ctx
+            .data_mut(|data| {
+                data.get_temp::<egui::TextureHandle>(egui::Id::new(("zapfast-mark", 44_usize)))
+            })
+            .expect("the mark was drawn at 44 pixels");
+        assert_eq!(texture.size(), [44, 44]);
+    }
+
+    /// The shortcuts dialog stays inside the window: two columns where the
+    /// window is wide enough, and a list that scrolls where it is too short.
+    #[test]
+    fn the_shortcuts_dialog_fits_the_window() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.dialog = Some(crate::model::Dialog::Shortcuts);
+        for size in [
+            [1180.0, 780.0],
+            [1600.0, 1000.0],
+            [760.0, 560.0],
+            [420.0, 380.0],
+        ] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::from(size));
+            for _ in 0..4 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.background_frame(&ctx);
+                    app.frame_ui(ui);
+                });
+                output.textures_delta.clear();
+            }
+            let dialog = ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("dialog")))
+                .expect("the dialog is open");
+            assert!(
+                screen.shrink(8.0).contains_rect(dialog),
+                "{size:?}: {dialog:?}"
+            );
+        }
+    }
+
     /// The profile picture in the chat-list header is the first control Tab
     /// reaches outside macOS. Registered as hover first and made clickable
     /// afterwards, it dropped focus on every frame and Tab went nowhere.
@@ -8912,6 +10572,52 @@ mod tests {
         );
     }
 
+    /// A video sent before ZapFast made thumbnails has none. With its file
+    /// here it still shows as a video; only without either is it a file card.
+    #[test]
+    fn a_video_without_a_thumbnail_shows_from_its_file() {
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, out)),
+                _ => {}
+            }
+        }
+        let drawn = |app: &mut App, ctx: &egui::Context| {
+            let mut shapes = Vec::new();
+            for _ in 0..3 {
+                shapes = frame_sized(app, ctx, 780.0, Vec::new());
+            }
+            let mut drawn = Vec::new();
+            for clipped in &shapes {
+                texts(&clipped.shape, &mut drawn);
+            }
+            drawn
+        };
+        let mut app = app();
+        apply_flags(&mut app, Some("video"));
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let chat = SAMPLES[0].id;
+        let rows = &mut app.conversations.get_mut(chat).unwrap().messages;
+        rows.retain(|row| row.id == "demo-video");
+        rows[0].thumbnail = None;
+        let card = |drawn: &[String]| drawn.iter().any(|text| text == "Video");
+        assert!(
+            !card(&drawn(&mut app, &ctx)),
+            "a video with its file here is not a file card"
+        );
+
+        let rows = &mut app.conversations.get_mut(chat).unwrap().messages;
+        if let Content::Video { media, .. } = &mut rows[0].content {
+            media.path = None;
+        }
+        assert!(
+            card(&drawn(&mut app, &ctx)),
+            "without a thumbnail or a file it is a card to download"
+        );
+    }
+
     #[test]
     fn sidebar_can_be_hidden_and_the_composer_sends() {
         let mut app = app();
@@ -8929,9 +10635,240 @@ mod tests {
         render(&mut app, &ctx);
         assert!(app.reply_to.is_none());
     }
+
+    /// Where the chat list's right edge is: the first chat row spans the
+    /// list's width.
+    fn chat_list_right(ctx: &egui::Context) -> f32 {
+        ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::chat_row_id(sample_ids()[0])))
+            .expect("the first chat is listed")
+            .right()
+    }
+
+    /// Drags from `from` through each x in `path` at one height, returning
+    /// the chat list's right edge after every step, and releases.
+    fn drag_list_edge(app: &mut App, ctx: &egui::Context, from: f32, path: &[f32]) -> Vec<f32> {
+        let y = 400.0;
+        let press = |x: f32, pressed| egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with(
+            app,
+            ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(from, y))],
+        );
+        frame_with(app, ctx, vec![press(from, true)]);
+        let mut edges = Vec::new();
+        for &x in path {
+            frame_with(app, ctx, vec![egui::Event::PointerMoved(egui::pos2(x, y))]);
+            edges.push(chat_list_right(ctx));
+        }
+        let last = path.last().copied().unwrap_or(from);
+        frame_with(app, ctx, vec![press(last, false)]);
+        render(app, ctx);
+        edges
+    }
+
+    /// #239: a chat list dragged out past its widest follows the pointer
+    /// back in the same drag, instead of sticking at its widest.
+    #[test]
+    fn the_chat_list_shrinks_back_from_its_widest() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        let edge = chat_list_right(&ctx);
+        let out = (1..=30).map(|step| edge + 10.0 * step as f32);
+        let back = (1..=40).map(|step| edge + 300.0 - 5.0 * step as f32);
+        let path: Vec<f32> = out.chain(back).collect();
+        let edges = drag_list_edge(&mut app, &ctx, edge, &path);
+        let end = *path.last().expect("a path");
+        assert!(
+            (chat_list_right(&ctx) - end).abs() < 12.0,
+            "the list stopped at {} with the pointer at {end}: {edges:?}",
+            chat_list_right(&ctx)
+        );
+    }
+
+    /// #239: a drag to the left, taken on the conversation's side of the
+    /// list's edge, narrows the list and never widens it.
+    #[test]
+    fn dragging_the_chat_list_edge_left_never_widens_it() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        let start = chat_list_right(&ctx) + 2.0;
+        let path: Vec<f32> = (1..=6).map(|step| start - 5.0 * step as f32).collect();
+        let edges = drag_list_edge(&mut app, &ctx, start, &path);
+        assert!(
+            edges.iter().all(|&edge| edge < start),
+            "dragging left widened the list: {edges:?}"
+        );
+        assert!(
+            (chat_list_right(&ctx) - (start - 30.0)).abs() < 12.0,
+            "the list stopped at {} instead of {}: {edges:?}",
+            chat_list_right(&ctx),
+            start - 30.0
+        );
+    }
 }
 
 /// A long transcript lays out only the rows near the screen.
+#[cfg(test)]
+mod wallpaper_tests {
+    use super::tests::{app, render};
+    use super::*;
+    use crate::settings::WallpaperColor;
+    use egui::epaint::{ClippedShape, Shape};
+
+    fn shapes(app: &mut App, ctx: &egui::Context) -> Vec<Shape> {
+        render(app, ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1180.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let ctx = ui.ctx().clone();
+                app.background_frame(&ctx);
+                app.frame_ui(ui);
+            },
+        );
+        output.textures_delta.clear();
+        let mut flat = Vec::new();
+        fn flatten(shape: Shape, into: &mut Vec<Shape>) {
+            match shape {
+                Shape::Vec(shapes) => shapes.into_iter().for_each(|shape| flatten(shape, into)),
+                shape => into.push(shape),
+            }
+        }
+        for ClippedShape { shape, .. } in output.shapes {
+            flatten(shape, &mut flat);
+        }
+        flat
+    }
+
+    /// Where meshes with this texture were painted.
+    fn textured(shapes: &[Shape], texture: egui::TextureId) -> Vec<egui::Rect> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.calc_bounds()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where rectangles of this colour were filled.
+    fn filled(shapes: &[Shape], color: egui::Color32) -> Vec<egui::Rect> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                Shape::Rect(rect) if rect.fill == color => Some(rect.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The default Theme wallpaper is the palette's chat colour, in the chat,
+    /// the preview, and its swatch, and follows a theme switch at once.
+    #[test]
+    fn the_theme_wallpaper_follows_the_palette() {
+        let mut app = app();
+        apply_flags(&mut app, Some("theme=Nord.json"));
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        assert_eq!(app.settings.dark_wallpaper_color, WallpaperColor::Theme);
+        assert!(app.current_chat().is_some(), "the sample opens a chat");
+        let nord = app.palette.chat;
+        assert_ne!(nord, crate::theme::Palette::dark().chat);
+        let chat = shapes(&mut app, &ctx);
+        assert!(
+            filled(&chat, nord)
+                .iter()
+                .any(|rect| rect.width() > 600.0 && rect.height() > 600.0),
+            "the conversation is filled with the theme's chat colour"
+        );
+        let (_, doodles) = crate::wallpaper::texture_ids(&ctx);
+        assert!(!textured(&chat, doodles).is_empty(), "doodles draw over it");
+
+        app.page = Page::Wallpaper;
+        let page = shapes(&mut app, &ctx);
+        let fills = filled(&page, nord);
+        assert!(
+            fills
+                .iter()
+                .any(|rect| rect.width() > 300.0 && rect.height() > 600.0),
+            "the preview shows the theme's chat colour"
+        );
+        assert!(
+            fills.iter().any(|rect| (rect.width() - 80.0).abs() < 1.0),
+            "the Theme swatch shows it too"
+        );
+
+        // Switching to a light theme recolours the preview with no new choice.
+        apply_flags(&mut app, Some("theme=Rose Pine Dawn.json"));
+        render(&mut app, &ctx);
+        assert!(!app.palette.dark);
+        let dawn = app.palette.chat;
+        assert_eq!(app.settings.wallpaper_color, WallpaperColor::Theme);
+        let page = shapes(&mut app, &ctx);
+        assert!(
+            filled(&page, dawn)
+                .iter()
+                .any(|rect| rect.width() > 300.0 && rect.height() > 600.0)
+        );
+    }
+
+    /// An image covers the chat and the preview in place of colour and
+    /// doodles, in light and dark mode, until it is removed.
+    #[test]
+    fn a_wallpaper_image_replaces_colour_and_doodles() {
+        let mut app = app();
+        apply_flags(&mut app, Some("wallpaper,wallpaper-image"));
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let page = shapes(&mut app, &ctx);
+        let (image, doodles) = crate::wallpaper::texture_ids(&ctx);
+        let image = image.expect("the image is uploaded");
+        let previews = textured(&page, image);
+        assert_eq!(previews.len(), 1, "one image fills the preview");
+        assert!(previews[0].width() > 300.0 && previews[0].height() > 600.0);
+        assert!(textured(&page, doodles).is_empty(), "no doodles over it");
+
+        app.page = Page::Chats;
+        let chat = shapes(&mut app, &ctx);
+        assert_eq!(
+            crate::wallpaper::texture_ids(&ctx).0,
+            Some(image),
+            "the texture is made once"
+        );
+        let covers = textured(&chat, image);
+        assert_eq!(covers.len(), 1);
+        assert!(covers[0].width() > 600.0 && covers[0].height() > 600.0);
+        assert!(textured(&chat, doodles).is_empty());
+
+        apply_flags(&mut app, Some("light"));
+        let light = shapes(&mut app, &ctx);
+        assert!(!app.palette.dark);
+        assert_eq!(textured(&light, image).len(), 1, "light mode keeps it");
+
+        app.actions.push(crate::model::Action::RemoveWallpaperImage);
+        let chat = shapes(&mut app, &ctx);
+        assert!(app.settings.wallpaper_image.is_none());
+        assert_eq!(crate::wallpaper::texture_ids(&ctx).0, None);
+        assert!(textured(&chat, image).is_empty());
+        assert!(!textured(&chat, doodles).is_empty(), "the doodles return");
+    }
+}
+
 #[cfg(test)]
 mod long_chat_tests {
     use super::tests::app;
@@ -8942,7 +10879,18 @@ mod long_chat_tests {
 
     /// Opens the first sample chat with `ROWS` messages of varied length, far
     /// more than a screen, spread over many days.
-    fn long_chat() -> (App, egui::Context, String) {
+    ///
+    /// The rows' heights depend on the clock: where the local days start
+    /// places the day separators, and the clock format sets each footer's
+    /// width and so where a text wraps. The time, zone, and format are fixed
+    /// until the returned guard drops, so every run lays out the same rows.
+    fn long_chat() -> (App, egui::Context, String, crate::util::fixed_clock::Guard) {
+        let clock = crate::util::fixed_clock::set(crate::util::fixed_clock::Clock {
+            // 14:00 UTC on Wednesday 11 March 2026.
+            now: 1_773_237_600,
+            zone: jiff::tz::TimeZone::UTC,
+            twelve_hour: false,
+        });
         let mut app = app();
         let ctx = egui::Context::default();
         app.attach(&ctx);
@@ -8966,7 +10914,7 @@ mod long_chat_tests {
             row.unread = 0;
         }
         app.actions.push(Action::OpenChat(chat.clone()));
-        (app, ctx, chat)
+        (app, ctx, chat, clock)
     }
 
     fn frame(
@@ -9031,7 +10979,7 @@ mod long_chat_tests {
 
     #[test]
     fn only_rows_near_the_screen_are_laid_out() {
-        let (mut app, ctx, chat) = long_chat();
+        let (mut app, ctx, chat, _clock) = long_chat();
         for _ in 0..3 {
             frame(&mut app, &ctx, Vec::new());
         }
@@ -9051,7 +10999,7 @@ mod long_chat_tests {
     /// with the scroll: the same distance for the same scroll every frame.
     #[test]
     fn scrolling_up_moves_the_rows_by_the_scroll_alone() {
-        let (mut app, ctx, _) = long_chat();
+        let (mut app, ctx, _, _clock) = long_chat();
         for _ in 0..3 {
             frame(&mut app, &ctx, Vec::new());
         }
@@ -9059,19 +11007,33 @@ mod long_chat_tests {
         frame(&mut app, &ctx, wheel(150.0));
         let mut before = painted_rows(&frame(&mut app, &ctx, wheel(150.0)));
         let mut step = None;
-        for _ in 0..60 {
+        for n in 0..60 {
             let after = painted_rows(&frame(&mut app, &ctx, wheel(150.0)));
             let moves: Vec<f32> = before
                 .iter()
                 .filter_map(|(row, y)| Some(after.get(row)? - y))
                 .collect();
             assert!(!moves.is_empty(), "some row stays on screen");
-            let step = *step.get_or_insert(moves[0]);
-            assert!(step > 100.0, "the view scrolls up: {step}");
-            for moved in moves {
+            // Whatever the frame moved by, every row on screen took it: a row
+            // measured for the first time moves the rows below it and nothing
+            // else, so it would stand out here.
+            for moved in &moves {
                 assert!(
-                    (moved - step).abs() < 1.0,
-                    "a row moved {moved} where the scroll moves {step}"
+                    (moved - moves[0]).abs() < 1.0,
+                    "a row moved {moved} where the frame moves {}",
+                    moves[0]
+                );
+            }
+            // The delta that accumulated while the view was still held at the
+            // end lands in one frame, so the first frame's step is not the
+            // wheel's. Every frame after it is, and it does not change.
+            if n > 0 {
+                let step = *step.get_or_insert(moves[0]);
+                assert!(step > 100.0, "the view scrolls up: {step}");
+                assert!(
+                    (moves[0] - step).abs() < 1.0,
+                    "a frame moved {} where the scroll moves {step}",
+                    moves[0]
                 );
             }
             before = after;
@@ -9085,7 +11047,7 @@ mod long_chat_tests {
 
     #[test]
     fn a_jump_far_up_lands_on_the_message_and_stays_there() {
-        let (mut app, ctx, chat) = long_chat();
+        let (mut app, ctx, chat, _clock) = long_chat();
         for _ in 0..3 {
             frame(&mut app, &ctx, Vec::new());
         }
@@ -9111,6 +11073,111 @@ mod long_chat_tests {
             Some(&y),
             "the message stays where it landed"
         );
+    }
+
+    /// One frame of a trackpad gesture at `pos`: several small steps, which
+    /// egui applies at once, or the fingers lifting when `steps` is empty.
+    fn swipe(pos: egui::Pos2, steps: &[f32]) -> Vec<egui::Event> {
+        let wheel = |delta: f32, phase| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta),
+            modifiers: egui::Modifiers::NONE,
+            phase,
+        };
+        std::iter::once(egui::Event::PointerMoved(pos))
+            .chain(if steps.is_empty() {
+                vec![wheel(0.0, egui::TouchPhase::End)]
+            } else {
+                steps
+                    .iter()
+                    .map(|&step| wheel(step, egui::TouchPhase::Move))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// #274: a trackpad scroll that begins over the messages stays with them
+    /// when the pointer drifts over the chat list, fingers down and in the
+    /// glide after they lift; a gesture that begins over the list scrolls it.
+    #[test]
+    fn a_scroll_stays_with_the_pane_it_began_over() {
+        let (mut app, ctx, chat, _clock) = long_chat();
+        // Enough chats for the list to scroll.
+        let template = app.chats[1].clone();
+        for n in 0..60 {
+            let mut extra = template.clone();
+            extra.id = format!("39000000{n:04}@s.whatsapp.net");
+            app.chats.push(extra);
+        }
+        for _ in 0..3 {
+            frame(&mut app, &ctx, Vec::new());
+        }
+        let list = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<f32>(crate::ui::chats::list_offset_id()))
+                .expect("the chat list has drawn")
+        };
+        let messages = |ctx: &egui::Context| {
+            ctx.data(|data| {
+                data.get_temp::<(f32, f32)>(crate::ui::conversation::scroll_metrics_id(&chat))
+            })
+            .expect("the message list has drawn")
+            .0
+        };
+        let over_list = egui::pos2(150.0, 400.0);
+        let over_messages = egui::pos2(700.0, 400.0);
+        let settle = |app: &mut App| {
+            for _ in 0..90 {
+                frame(app, &ctx, Vec::new());
+            }
+        };
+
+        // Down the list first, so it has room to move either way.
+        let before = list(&ctx);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, swipe(over_list, &[-6.0; 6]));
+        }
+        frame(&mut app, &ctx, swipe(over_list, &[]));
+        settle(&mut app);
+        assert!(
+            list(&ctx) > before + 50.0,
+            "a swipe over the list scrolls it"
+        );
+
+        // Up the messages, then over the list with the fingers still down.
+        let list_before = list(&ctx);
+        let start = messages(&ctx);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, swipe(over_messages, &[6.0; 6]));
+        }
+        let over = messages(&ctx);
+        assert!(over < start, "the swipe scrolls the messages up");
+        for _ in 0..3 {
+            frame(&mut app, &ctx, swipe(over_list, &[6.0; 6]));
+        }
+        assert!(
+            messages(&ctx) < over - 50.0,
+            "the messages keep scrolling with the pointer over the list"
+        );
+        assert_eq!(list(&ctx), list_before, "the list holds still");
+        // The fingers lift over the list; the glide stays with the messages.
+        let lifted = messages(&ctx);
+        frame(&mut app, &ctx, swipe(over_list, &[]));
+        settle(&mut app);
+        assert_eq!(list(&ctx), list_before, "the glide leaves the list alone");
+        if cfg!(target_os = "linux") {
+            assert!(messages(&ctx) < lifted, "the glide scrolls the messages");
+        }
+
+        // A new gesture over the list scrolls the list.
+        let still = messages(&ctx);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, swipe(over_list, &[6.0; 6]));
+        }
+        assert!(
+            list(&ctx) < list_before,
+            "a new swipe over the list scrolls it"
+        );
+        assert_eq!(messages(&ctx), still, "and leaves the messages alone");
     }
 }
 
@@ -9215,5 +11282,206 @@ mod picture_edge_tests {
             let shown = chat_with_picture(2, height as f32);
             assert!(!shown.is_empty(), "the chat shows its end ({height} tall)");
         }
+    }
+}
+
+#[cfg(test)]
+mod bubble_detail_tests {
+    use super::tests::app;
+    use super::*;
+
+    /// Runs frames at `size` and returns the last frame's shapes.
+    fn frames(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.background_frame(&ctx);
+                    app.frame_ui(ui);
+                },
+            );
+            output.textures_delta.clear();
+            shapes = output.shapes;
+        }
+        shapes
+    }
+
+    fn rect(ctx: &egui::Context, id: egui::Id) -> Option<egui::Rect> {
+        ctx.data(|data| data.get_temp::<egui::Rect>(id))
+    }
+
+    fn photos() -> (App, egui::Context) {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("photos"));
+        frames(&mut app, &ctx, egui::vec2(1180.0, 1400.0));
+        (app, ctx)
+    }
+
+    /// "Forwarded" sits at the start of the bubble, just under its top, on
+    /// incoming and own messages alike (#250).
+    #[test]
+    fn the_forwarded_label_starts_at_the_bubble_start_on_both_sides() {
+        let (_app, ctx) = photos();
+        let chat = SAMPLES[0].id;
+        for id in ["photos-forwarded-in", "photos-forwarded-out", "photos-in"] {
+            let bubble = crate::ui::conversation::bubble_id(chat, id);
+            let frame = rect(&ctx, bubble.with("rect")).expect("the bubble was drawn");
+            let label = rect(&ctx, bubble.with("forwarded")).expect("the label was drawn");
+            assert!(
+                (label.left() - (frame.left() + 10.0)).abs() < 0.5,
+                "{id}: the label starts at the bubble's start ({label:?} in {frame:?})"
+            );
+            assert!(
+                label.top() - frame.top() <= 7.0,
+                "{id}: the label sits just under the bubble's top ({label:?} in {frame:?})"
+            );
+        }
+        let bubble = crate::ui::conversation::bubble_id(chat, "photos-in");
+        let label = rect(&ctx, bubble.with("forwarded")).unwrap();
+        let picture = rect(&ctx, bubble.with("picture")).expect("the picture was drawn");
+        assert!(
+            picture.top() - label.bottom() <= 3.5,
+            "the picture follows the label closely ({label:?}, {picture:?})"
+        );
+    }
+
+    /// A picture without a caption carries its time and ticks over its
+    /// bottom corner, and its bubble closes just under it; with a caption
+    /// they stay on the caption's line below the picture (#251).
+    #[test]
+    fn a_picture_without_a_caption_carries_its_time_over_its_corner() {
+        let (_app, ctx) = photos();
+        let chat = SAMPLES[0].id;
+        for id in ["photos-in", "photos-out"] {
+            let bubble = crate::ui::conversation::bubble_id(chat, id);
+            let frame = rect(&ctx, bubble.with("rect")).expect("the bubble was drawn");
+            let picture = rect(&ctx, bubble.with("picture")).expect("the picture was drawn");
+            let footer = rect(&ctx, crate::ui::conversation::footer_id(chat, id))
+                .expect("the time was drawn");
+            assert!(
+                picture.contains_rect(footer),
+                "{id}: the time is over the picture ({footer:?} in {picture:?})"
+            );
+            assert!(
+                picture.right() - footer.right() <= 12.0
+                    && picture.bottom() - footer.bottom() <= 8.0,
+                "{id}: the time sits in the picture's bottom corner ({footer:?} in {picture:?})"
+            );
+            assert!(
+                frame.bottom() - picture.bottom() <= 7.0,
+                "{id}: no strip under the picture ({picture:?} in {frame:?})"
+            );
+            assert!(
+                (frame.left() + 10.0 - picture.left()).abs() < 0.5
+                    && (frame.right() - 10.0 - picture.right()).abs() < 0.5,
+                "{id}: the bubble wraps the picture ({picture:?} in {frame:?})"
+            );
+        }
+        let bubble = crate::ui::conversation::bubble_id(chat, "photos-caption");
+        let picture = rect(&ctx, bubble.with("picture")).expect("the captioned picture");
+        let footer = rect(
+            &ctx,
+            crate::ui::conversation::footer_id(chat, "photos-caption"),
+        )
+        .expect("the captioned picture's time");
+        assert!(
+            footer.top() >= picture.bottom(),
+            "with a caption the time stays below the picture ({footer:?}, {picture:?})"
+        );
+    }
+
+    /// A chat with unsent text shows it in its row, after an accent
+    /// "Draft:", while the open chat's text stays in the composer (#245).
+    #[test]
+    fn a_chat_with_a_draft_shows_it_in_the_list() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("drafts"));
+        let shapes = frames(&mut app, &ctx, egui::vec2(1180.0, 780.0));
+        let texts: Vec<(String, egui::Color32)> = shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(text.fallback_color, |section| section.format.color),
+                )),
+                _ => None,
+            })
+            .collect();
+        let labels: Vec<_> = texts
+            .iter()
+            .filter(|(text, _)| text.trim() == "Draft:")
+            .collect();
+        assert_eq!(labels.len(), 2, "two rows carry a draft: {texts:?}");
+        assert!(
+            labels.iter().all(|(_, color)| *color == app.palette.accent),
+            "the label is in the accent: {labels:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(text, _)| text.starts_with("Sounds good, see you at")),
+            "a draft reads on one line: {texts:?}"
+        );
+        assert_eq!(
+            app.draft_preview(SAMPLES[2].id).as_deref(),
+            Some("Sounds good, see you at the station")
+        );
+        assert_eq!(
+            app.draft_preview(SAMPLES[0].id),
+            None,
+            "the open chat's text is in the composer"
+        );
+        app.drafts.insert(SAMPLES[1].id.into(), " \n ".into());
+        assert_eq!(
+            app.draft_preview(SAMPLES[1].id),
+            None,
+            "blank text is no draft"
+        );
+    }
+
+    /// In a wide window the settings keep their width and sit in the
+    /// middle of the page instead of against its left edge (#242).
+    #[test]
+    fn the_settings_column_is_centred_in_a_wide_window() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("settings"));
+        let column = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<egui::Rangef>(crate::ui::settings::column_id()))
+                .expect("the settings were drawn")
+        };
+        let mut columns = Vec::new();
+        for width in [1400.0, 1800.0] {
+            frames(&mut app, &ctx, egui::vec2(width, 900.0));
+            let drawn = column(&ctx);
+            assert!((drawn.span() - 640.0).abs() < 0.5, "{drawn:?}");
+            columns.push(drawn);
+        }
+        let moved = columns[1].center() - columns[0].center();
+        assert!(
+            (moved - 200.0).abs() < 1.0,
+            "the column follows the middle of the page: moved {moved}"
+        );
+        // A narrow page keeps the usual margins instead.
+        frames(&mut app, &ctx, egui::vec2(900.0, 900.0));
+        assert!(column(&ctx).span() < 640.0, "{:?}", column(&ctx));
     }
 }
