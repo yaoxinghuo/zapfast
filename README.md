@@ -36,6 +36,16 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
 
 - **Links to your phone.** Scan a QR code or link with your phone number.
   Recent history is copied to this computer after linking and stored here.
+  Several numbers can stay linked in one window: click your own picture at
+  the top of the chat list to switch between them or to add another (a dot on
+  it means another number has unread chats; **Settings > Account > Add
+  account** works too). Each number keeps its own keys, archive,
+  media, and per-number settings (notifications, receipts, typing, automatic
+  downloads, wallpaper); the taskbar count adds up every number's unread
+  chats. A setup from an earlier version moves into `accounts/1/` on the first
+  start, keyring key included; if that cannot finish (a locked keyring, or a
+  folder already in the way), ZapFast stops without moving anything and says
+  why in its log.
 - **Chats.** See pinned, unread, muted, and archived chats, typing indicators,
   and message status. Search chats, saved messages, and contacts. The
   **Search** icon in a chat's header (or **Ctrl+F**) opens a pane beside the
@@ -69,7 +79,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   Unnamed groups use a shared participant summary for their title and subtitle.
   It names each saved contact by its whole first name as saved on the phone (the
   first word of the name when none is known), repeated names appear as `Andrea ×3`, and your
-  own entry is shown as `You`.
+  own entry is shown as `You`. The sender before a group's last message goes by
+  the same name. Contacts synced by an older version are read once more from the
+  phone after updating, so their first names are known too.
   Incomplete group metadata preserves known names and retries with backoff;
   an empty cached subject remains eligible for recovery.
   Typing indicators show other participants, excluding your own linked devices.
@@ -166,7 +178,7 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   a button copies their text for a bug report. A repeated error replaces its
   earlier copy, and only the three newest are kept.
 - **Send attachments with captions.** Paste a picture or copied files, drop
-  files (not yet on Wayland), or choose **Send files** from the plus menu. They stay in the composer until you send them or press Escape.
+  files, or choose **Send files** from the plus menu. They stay in the composer until you send them or press Escape.
   Pasting a picture uses its image data without adding the source URL or HTML
   to your caption. Files copied in Finder, Explorer, or a Linux file manager
   paste as the files themselves, not their icons. Text-only clipboard contents
@@ -217,7 +229,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   a chat's draft in its row, after "Draft:". Open menus, dialogs, and
   unfinished actions are dismissed first. Sending while reading older messages
   keeps your place; use the newest-message button or End to return to the latest
-  message. Type `:name` to autocomplete an emoji without leaving the composer,
+  message. The chat list scrolls to the top after you send, where the chat now
+  is; under the Favorites chip the list keeps the phone's order and stays in
+  place. Type `:name` to autocomplete an emoji without leaving the composer,
   or `@` in a group to mention a member.
   Reply, react with any emoji, edit, forward, delete, and check when a message was sent,
   delivered, or read. Replies can be text, attachments, voice messages,
@@ -363,8 +377,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   `~/.config/autostart/zapfast.desktop` on Linux, a LaunchAgent in
   `~/Library/LaunchAgents` on macOS, or a `Run` entry for your user on Windows,
   and removes it when turned off. `zapfast --start-hidden` does the same by hand;
-  it opens the window anyway when no tray is available. The Flatpak does not
-  offer this setting yet.
+  it opens the window anyway when no tray shows ZapFast yet. The tray icon
+  still appears once a panel starts, even one that starts after ZapFast at
+  login. The Flatpak does not offer this setting yet.
 - **Desktop notifications.** Get notifications with the chat picture when you
   are away from the open chat. Muted chats do not notify you, and archived
   chats stay quiet until you unarchive them. Windows notifications
@@ -413,7 +428,10 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   and Enter jumps to one; with no chat open it searches your chats, and in
   Settings it searches the settings), `Alt+↑/↓` or WhatsApp's
   `Ctrl+Shift+[`/`Ctrl+Shift+]` switches chats and
-  keeps the active chat visible in the list, `↑` in an empty input edits your
+  keeps the active chat visible in the list, `Ctrl+1` through `Ctrl+9` opens
+  the chat at that position in the current chat list, following its pins,
+  search, and filter (a missing position does nothing),
+  `↑` in an empty input edits your
   previous message, `PgUp`/`PgDn` scroll the open chat by about a page,
   `Home`/`End` jump to the top or newest message of the open chat (when the
   input is empty), `Esc` cancels the current action, `Ctrl+L` focuses the
@@ -477,6 +495,12 @@ Builds for every release are on the
 | Linux x86_64 and arm64, one file | `zapfast-X.Y.Z-x86_64.AppImage` or `-aarch64.AppImage`: make it executable and run it |
 | Windows x64 and arm64 | `zapfast-vX.Y.Z-<target>-setup.exe` (no administrator rights needed), or the `.zip` |
 | macOS, universal | `zapfast-vX.Y.Z-macos-universal.dmg` |
+
+ZapFast draws its window with OpenGL and needs a graphics driver that offers
+OpenGL 2.1 or newer. On Windows, install the driver from the maker of the
+graphics chip: the Microsoft Basic Display Adapter, some virtual machines and
+some remote desktop sessions offer no usable OpenGL. When the driver falls
+short, Windows shows a message saying so instead of starting.
 
 On macOS, the rounded Dock icon matches the app bundle. Native menus provide
 Settings, editing, search, view controls, and window commands. The traffic
@@ -596,8 +620,10 @@ way. The pencil opens **New chat**, with **Message yourself** and
 lets you message a new number without saving it. **Also save to your phone's
 contacts** in that dialog adds the contact to your phone's address book too, as
 the phone asks; the next contact starts from your last choice. You
-can also open a group member's contact card. Saved names sync through WhatsApp
-to your phone and linked devices.
+can also open a group member's contact card. Renaming a contact opens with its
+first and last name as saved, each of which may hold several words; a name
+saved without a separate first name opens whole in the first-name field. Saved
+names sync through WhatsApp to your phone and linked devices.
 
 ### Locked chats
 
@@ -727,9 +753,9 @@ English. `Ctrl+F` on the Settings page focuses the field, and `Esc` clears it.
 **Settings > Appearance > Language** chooses the interface language. **Auto**
 follows the first of the operating system's preferred languages that ZapFast
 has a translation for, and falls back to English when it has none. Brazilian
-Portuguese, German, Spanish, Italian, French, Russian, and Simplified Chinese
-cover the chat list, search, composer, shortcut hints, Settings, and dates.
-Translations are compiled from gettext PO
+Portuguese, German, Spanish, Italian, French, Russian, Simplified Chinese,
+Traditional Chinese, and Turkish cover the chat list, search, composer,
+shortcut hints, Settings, and dates. Translations are compiled from gettext PO
 files at build time, with no runtime parsing or network access. Message
 contents, contact names, logs, and protocol errors are never translated, and
 copied messages keep WhatsApp's `[time, date] Name:` format.
@@ -749,11 +775,13 @@ from the environment and honors `NO_PROXY`.
 | What | Linux | Notes |
 | --- | --- | --- |
 | Settings | `~/.config/zapfast/settings.json` | JSON, safe to edit; the app lock password and the locked-chats code are kept only as salted verifiers |
-| Device keys | `~/.local/state/zapfast/session.db` | Owned by whatsapp-rust; deleting it unlinks |
-| Messages | `~/.local/state/zapfast/archive.db` | SQLCipher-encrypted SQLite, unlocked by the OS keyring; raw messages retain attachment keys |
-| Attachments, avatars | `~/.cache/zapfast/` | Safe to delete; **Settings > Files > Change…** sends new downloads to another folder, leaving earlier ones in place |
-| Favorite stickers and packs | `~/.local/state/zapfast/stickers/` | Plain WebP files; each pack is a folder |
-| Wallpaper image | `~/.local/state/zapfast/wallpaper.jpg` | Copy of the chosen picture, or `.png`, `.webp`, `.gif`; deleted by **Remove image** |
+| Account list | `~/.config/zapfast/accounts.json` | Which numbers are linked here and which one is showing |
+| Device keys | `~/.local/state/zapfast/accounts/<id>/session.db` | Owned by whatsapp-rust; deleting it unlinks that number |
+| Messages | `~/.local/state/zapfast/accounts/<id>/archive.db` | SQLCipher-encrypted SQLite, unlocked by the OS keyring; raw messages retain attachment keys |
+| Attachments, avatars | `~/.cache/zapfast/accounts/<id>/` | Safe to delete; **Settings > Files > Change…** sends new downloads to another folder, leaving earlier ones in place |
+| Favorite stickers and packs | `~/.local/state/zapfast/accounts/<id>/stickers/` | Plain WebP files; each pack is a folder |
+| Wallpaper image | `~/.local/state/zapfast/accounts/<id>/wallpaper.jpg` | Copy of the chosen picture for that number, or `.png`, `.webp`, `.gif`; deleted by **Remove image** |
+| Per-number settings | `~/.local/state/zapfast/accounts/<id>/settings.json` | Notifications, receipts, typing, automatic downloads, the last open chat, and the wallpaper of that number |
 | Log of the last run | `~/.local/state/zapfast/zapfast.log` | `--verbose` for more; **Settings > Files > Log > Open** shows it in its folder when no app opens it |
 
 macOS and Windows use the standard platform directories selected by the

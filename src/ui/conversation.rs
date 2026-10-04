@@ -1736,7 +1736,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         locale: app.locale,
         chat,
         me: app.me.as_deref(),
-        auto_download: app.settings.auto_download,
+        auto_download: app.account().settings.auto_download,
         connected: app.link.is_connected(),
         poll_voting: &app.poll_voting,
         interactive_pending: &app.interactive_sending,
@@ -2262,6 +2262,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     let complete = conversation.complete;
     let loading = conversation.loading_older;
     let fetching = conversation.fetching_phone;
+    let fetching_explicit = conversation.phone_explicit;
     let exhausted = conversation.phone_exhausted;
     conversation.rows = rows;
     // Keep the rows on screen where they were when rows above them changed
@@ -2354,8 +2355,18 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     // request more immediately.
     let fits = output.content_size.y <= output.inner_rect.height() + 1.0;
     let near_top = output.state.offset.y < 80.0;
-    if (near_top || fits) && ((!complete && !loading) || (complete && !fetching && !exhausted)) {
-        actions.push(Action::LoadOlder(chat.id.clone()));
+    // Only a transcript the reader scrolled up through is their ask; a short
+    // chat, or one still on its way to the end, is not.
+    let explicit = near_top && !fits && !scroll_to_bottom;
+    // A reader reaching the top while an automatic request waits claims it.
+    let claim = fetching && explicit && !fetching_explicit;
+    if (near_top || fits)
+        && ((!complete && !loading) || (complete && (!fetching || claim) && !exhausted))
+    {
+        actions.push(Action::LoadOlder {
+            chat: chat.id.clone(),
+            explicit,
+        });
     }
     app.actions.extend(actions);
     if edge_scrolled_up {
@@ -4240,6 +4251,35 @@ struct SharedContact {
     /// parameter WhatsApp adds, or a number written in international form.
     /// A local number without a country code cannot name one.
     account: Option<String>,
+    /// The first name from the card's structured `N` property, middle names
+    /// included, for the contact editor; none when the card has none.
+    first_name: Option<String>,
+}
+
+/// The first name in a vCard `N` value
+/// (`family;given;additional;prefix;suffix`), middle names included.
+/// Components are split at unescaped semicolons only.
+fn vcard_first_name(value: &str) -> Option<String> {
+    let mut parts = vec![String::new()];
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => match chars.next() {
+                Some('n' | 'N') => parts.last_mut()?.push(' '),
+                Some(escaped) => parts.last_mut()?.push(escaped),
+                None => {}
+            },
+            ';' => parts.push(String::new()),
+            _ => parts.last_mut()?.push(character),
+        }
+    }
+    let part = |index: usize| parts.get(index).map_or("", |part| part.trim());
+    let first = [part(1), part(2)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!first.is_empty()).then_some(first)
 }
 
 fn vcard_tel_account(property: &str, value: &str) -> Option<String> {
@@ -4259,6 +4299,7 @@ fn vcard_tel_account(property: &str, value: &str) -> Option<String> {
 
 fn shared_contact_details(vcard: &str, fallback_name: &str) -> Option<SharedContact> {
     let mut name = None;
+    let mut first_name = None;
     let mut first_phone = None;
     let mut preferred_phone: Option<(u8, (String, Option<String>))> = None;
     let mut first_card: Vec<String> = Vec::new();
@@ -4294,6 +4335,8 @@ fn shared_contact_details(vcard: &str, fallback_name: &str) -> Option<SharedCont
         let property_name = raw_name.rsplit('.').next().unwrap_or(raw_name);
         if property_name.eq_ignore_ascii_case("FN") {
             name = Some(value.trim().to_owned());
+        } else if property_name.eq_ignore_ascii_case("N") {
+            first_name = vcard_first_name(value);
         } else if property_name.eq_ignore_ascii_case("TEL") {
             let number = value.trim().to_owned();
             if number.chars().filter(char::is_ascii_digit).count() < 7 {
@@ -4320,6 +4363,7 @@ fn shared_contact_details(vcard: &str, fallback_name: &str) -> Option<SharedCont
         name,
         number,
         account,
+        first_name,
     })
 }
 
@@ -4591,6 +4635,7 @@ fn content(
                     match details.as_ref() {
                         Some(SharedContact {
                             account: Some(account),
+                            first_name,
                             ..
                         }) => {
                             let id = format!("{account}@s.whatsapp.net");
@@ -4617,7 +4662,10 @@ fn content(
                                     )
                                     .clicked()
                                 {
-                                    let (first, last) = crate::util::split_name(name);
+                                    // Split where the card's first name ends, so a
+                                    // first name of several words stays whole.
+                                    let (first, last) =
+                                        crate::util::editor_names(name, first_name.as_deref());
                                     actions.push(Action::NewContact {
                                         phone: account.clone(),
                                         first,
@@ -7033,7 +7081,43 @@ mod tests {
             name: name.to_owned(),
             number: number.to_owned(),
             account: account.map(str::to_owned),
+            first_name: None,
         })
+    }
+
+    #[test]
+    fn a_shared_contact_keeps_the_first_name_of_its_card() {
+        let first = |card: &str| {
+            shared_contact_details(card, "Fallback")
+                .expect("a contact")
+                .first_name
+        };
+        // A first name of two words stays whole, as the card has it (#314).
+        assert_eq!(
+            first("BEGIN:VCARD\nN:;My Dih;;;\nFN:My Dih\nTEL:+15550101234\nEND:VCARD").as_deref(),
+            Some("My Dih")
+        );
+        assert_eq!(
+            first("BEGIN:VCARD\nN:Evans;Mary;Ann;;\nTEL:+15550101234\nEND:VCARD").as_deref(),
+            Some("Mary Ann")
+        );
+        assert_eq!(
+            first("BEGIN:VCARD\nN:Smith;Ada\\;Jo;;\nTEL:+15550101234\nEND:VCARD").as_deref(),
+            Some("Ada;Jo")
+        );
+        assert_eq!(
+            first("BEGIN:VCARD\nN:山田;太郎;;;\nTEL:+15550101234\nEND:VCARD").as_deref(),
+            Some("太郎")
+        );
+        // Without a structured first name nothing is known.
+        assert_eq!(
+            first("BEGIN:VCARD\nN:Evans;;;;\nTEL:+15550101234\nEND:VCARD"),
+            None
+        );
+        assert_eq!(
+            first("BEGIN:VCARD\nFN:Ada Lovelace\nTEL:+15550101234\nEND:VCARD"),
+            None
+        );
     }
 
     #[test]

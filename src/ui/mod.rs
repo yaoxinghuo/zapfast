@@ -1,5 +1,6 @@
 //! Window layout: panels, overlays, keyboard shortcuts.
 
+pub mod accounts;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
@@ -58,6 +59,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     titlebar_strip(app, ui);
     if !app.is_linked() {
         login::show(app, ui);
+        accounts::corner(app, ctx);
         dialogs::show(app, ctx);
         update::show(app, ctx);
         toasts(app, ctx);

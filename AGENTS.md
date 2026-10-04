@@ -35,10 +35,33 @@ protocol. These notes are for coding agents and new contributors.
   them after the frame. Never mutate application state from inside a view
   beyond the view's own fields (composer text, search text, flags).
 - `src/backend.rs` is the interface's handle to a tokio runtime on its own
-  thread; `src/backend/worker.rs` runs there. It owns the whatsapp-rust
-  `Bot`, the message archive, downloads, and profile pictures. The two
-  sides talk only through `Command` (interface to runtime) and `Event`
-  (runtime to interface); every event wakes the window through `Waker`.
+  thread; `src/backend/worker.rs` runs there. Each account owns one
+  `Backend`. It owns the whatsapp-rust `Bot`, the message archive,
+  downloads, and profile pictures. The two sides talk only through
+  `Command` (interface to runtime) and `Event` (runtime to interface);
+  every event wakes the window through `Waker`.
+- Several WhatsApp accounts may be linked in one process. Each account has
+  its own folder under `state/accounts/<id>/` (`session.db`, `archive.db`,
+  stickers) and `cache/accounts/<id>/` (media, avatars). Never mix files,
+  caches, or SQLCipher keys across accounts. `ChatId` is unique only inside
+  one account. Notifications, tray clicks, and search hits always carry an
+  `AccountId`. `src/app.rs` is the process shell (theme, window, tray,
+  updates). Each `Account` in `src/account.rs` owns a `Backend`/`Worker`.
+  Views draw the active account through `App`'s `Deref` to `Account`.
+  Our own avatar at the top of the chat list opens the account switcher
+  (`src/ui/accounts.rs`) on every platform: only the accounts (picture, name
+  or number, unread chats, a check on the one on screen) and Add account; the
+  settings keep their own button. A dot on the avatar means another account
+  has unread chats. Events from an account that is not on screen are
+  applied with `App::events_hidden` set: they update that account only, never
+  the window's composer, dialogs, playback, or read state (a hidden account's
+  remembered chat is not being read, so it sends no receipts). Process-wide
+  settings (download folder, proxy) go to every backend. `paths.rs` moves a
+  single-account layout into `accounts/1/` at startup, after logging starts:
+  it refuses when anything is in the way, copies and reads back the archive's
+  keyring key before moving it, and moves SQLite side files before their
+  database. Removing an account deletes its folders after its backend has
+  stopped, then its keyring entry.
 - `src/archive.rs` is the SQLite store of chats, messages, contacts, and
   privacy-id mappings. WhatsApp replays history once, at link time, so the
   archive is the only copy. It keeps each message's raw protobuf because
@@ -258,9 +281,18 @@ protocol. These notes are for coding agents and new contributors.
   Linux, tray-icon on Windows and macOS; on macOS made with the first window
   and pumped by `fastframe_tray::idle` while none exists), and `src/macos.rs`
   hands its menu events to `fastframe_tray::claim_menu_event` first.
-  `src/single_instance.rs` holds a lock file in the runtime
-  directory, and a second launch asks the first to surface over a private
-  socket (a token-checked loopback port on Windows). `src/notify.rs` sends desktop notifications
+  Closing keeps ZapFast running, and a hidden start stays hidden, only while
+  `Tray::is_shown`: on Linux the item exists before a panel shows it (a
+  start at login beats the panel) and registers once one appears. A
+  hidden start makes the macOS item with `Tray::create_item`, which does not
+  bring ZapFast forward; a window's `attach` makes it otherwise.
+  `src/single_instance.rs` claims fastframe-instance's slot in the runtime
+  directory (`Slot::at(runtime, "fastsapp")`, so requests and replies stay
+  `fastsapp:show` and `fastsapp:ok` for older copies), and a second launch
+  asks the first to surface over a private socket (a token-checked loopback
+  port on Windows); the handler queues `ControlCommand`s and declines unknown
+  verbs. The fixed port 47119 that 0.15-era copies look for stays in ZapFast,
+  answered once the slot is claimed. `src/notify.rs` sends desktop notifications
   for `Event::Incoming` (live messages from others, not history) when the
   reader is away from that chat; a click carries the chat and the message
   id, so the reader lands on the announced message. macOS has no title bar:
@@ -293,7 +325,19 @@ protocol. These notes are for coding agents and new contributors.
 - Older history comes from the phone on demand (`Command::FetchOlder` →
   `Client::fetch_message_history` → a `HistorySync` chunk with
   `sync_type == ON_DEMAND`); the archive is paged first, the phone only
-  when it is exhausted.
+  when it is exhausted. Short and empty chats ask on their own, and a phone
+  with nothing to add often leaves that unanswered, so only an `explicit`
+  request (the reader scrolled to the top) reports a silent phone, once per
+  chat until it answers or the link reconnects. A chunk saying nothing more
+  remains on the phone sets `chats.history_start`, and that chat is not
+  asked again.
+- Scrolling comes from fastframe-scroll: `App::scrolling.apply` runs first
+  in each unlocked frame and sets the wheel step (120 points a notch), and on
+  Linux scales touchpad gestures, glides after the lift, and holds a gesture
+  to its axis (Shift turns it sideways). `App::route_scroll` then keeps a
+  gesture, glide included, with the pane it began over (`ScrollRoute`, #274),
+  asking `Scrolling::gliding`; the image preview pans with a touchpad and
+  zooms with a wheel by `Scrolling::from_trackpad`.
 - Platform-specific code belongs behind `cfg` blocks; a change for one
   platform must keep the other two compiling.
 
